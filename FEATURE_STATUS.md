@@ -4,12 +4,13 @@ This file tracks the 20 features requested by the user in this repo conversation
 
 ## Count Summary
 - Total features requested: **20**
-- Features added by my recent commits in this thread: **5**
+- Features added by my recent commits in this thread: **6**
   - #1 CUDA Error Checking Macro
   - #2 Fix Multi-GPU Work Split
   - #3 SIGINT Handler (Ctrl+C) with checkpoint save
   - #4 SHA-256 multi-block padding fix (FIPS-style final block handling)
   - #5 Chunked Dictionary Loading (streaming chunks with carry-over handling)
+  - #13 Device Selection (select specific GPU indices at runtime)
 
 ## Detailed Status
 
@@ -27,7 +28,7 @@ This file tracks the 20 features requested by the user in this repo conversation
 | 10 | Auto-Tune Blocks/Threads | ❌ Not added | Static launch config currently used. |
 | 11 | CUDA Streams (Async) | ❌ Not added | No stream-based async pipeline present. |
 | 12 | Temperature/Power Monitor (NVML) | ❌ Not added | NVML integration not present. |
-| 13 | Device Selection (GPU include/exclude) | ❌ Not added | No CLI option for selecting specific GPUs. |
+| 13 | Device Selection (GPU include/exclude) | ✅ Added | Runtime device list input supports all or explicit indices like `0,1,3`. |
 | 14 | Kernel Separation (per hash type) | ❌ Not added | Hash-type switch remains inside kernels. |
 | 15 | PBKDF2-HMAC-SHA256/SHA1 | ❌ Not added | Algorithms not implemented. |
 | 16 | bcrypt | ❌ Not added | Not implemented. |

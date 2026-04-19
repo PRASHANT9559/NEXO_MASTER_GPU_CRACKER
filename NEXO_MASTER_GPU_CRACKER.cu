@@ -516,6 +516,34 @@ int loadCheckpoint(const char* filename, CheckpointState* state) {
     return 0;
 }
 
+int parseDeviceList(const char* input, int max_devices, int* out_devices, int* out_count) {
+    if (!input || !out_devices || !out_count) return 0;
+    if (strcmp(input, "-1") == 0) {
+        *out_count = 0;
+        return 1;
+    }
+
+    char temp[128];
+    strncpy(temp, input, sizeof(temp) - 1);
+    temp[sizeof(temp) - 1] = '\0';
+
+    int count = 0;
+    char* token = strtok(temp, ",");
+    while (token) {
+        int dev = atoi(token);
+        if (dev < 0 || dev >= max_devices) return 0;
+
+        int duplicate = 0;
+        for (int i = 0; i < count; i++) {
+            if (out_devices[i] == dev) { duplicate = 1; break; }
+        }
+        if (!duplicate) out_devices[count++] = dev;
+        token = strtok(NULL, ",");
+    }
+    *out_count = count;
+    return count > 0;
+}
+
 int checkPotfile(const char* potfile_path, const char* target_hash, char* found_password) {
     FILE* fp = fopen(potfile_path, "r");
     if (!fp) return 0;
@@ -1227,8 +1255,29 @@ int main() {
             return 1;
         }
         printf("\n🖥️  Detected %d GPU(s)\n", device_count);
+        for (int dev = 0; dev < device_count; dev++) {
+            cudaDeviceProp prop;
+            CUDA_CHECK(cudaGetDeviceProperties(&prop, dev));
+            printf("    [%d] %s | %.2f GB VRAM\n", dev, prop.name, (double)prop.totalGlobalMem / (1024.0 * 1024.0 * 1024.0));
+        }
 
-        if (device_count > 1) {
+        int selected_devices[32];
+        int selected_count = 0;
+        char device_input[128];
+        printf("\n[8] Device Selection (-1 = all, e.g. 0,1,3): ");
+        scanf("%127s", device_input);
+        if (!parseDeviceList(device_input, device_count, selected_devices, &selected_count)) {
+            printf("\n❌ Invalid device selection. Falling back to all devices.\n");
+            selected_count = 0;
+        }
+        if (selected_count == 0) {
+            for (int i = 0; i < device_count; i++) selected_devices[i] = i;
+            selected_count = device_count;
+        }
+        printf("✅ Using %d GPU(s): ", selected_count);
+        for (int i = 0; i < selected_count; i++) printf("%d%s", selected_devices[i], (i == selected_count - 1) ? "\n" : ", ");
+
+        if (selected_count > 1) {
             printf("⚡ Using Multi-GPU mode with load balancing\n");
         }
 
@@ -1260,16 +1309,17 @@ int main() {
                 if (difftime(time(NULL), wall_start) > 43200 || (fixed_limit > 0 && total_scanned >= fixed_limit)) break;
 
                 // Distribute workload across GPUs
-                const int base_blocks = blocks / device_count;
-                const int extra_blocks = blocks % device_count;
+                const int base_blocks = blocks / selected_count;
+                const int extra_blocks = blocks % selected_count;
                 uint64_t dispatched_work = 0;
 
-                for (int dev = 0; dev < device_count; dev++) {
+                for (int slot = 0; slot < selected_count; slot++) {
+                    int dev = selected_devices[slot];
                     CUDA_CHECK(cudaSetDevice(dev));
                     int h_found_reset = 0;
                     CUDA_CHECK(cudaMemcpyToSymbol(d_found, &h_found_reset, sizeof(int)));
 
-                    int dev_blocks = base_blocks + (dev < extra_blocks ? 1 : 0);
+                    int dev_blocks = base_blocks + (slot < extra_blocks ? 1 : 0);
                     if (dev_blocks == 0) continue;
 
                     uint64_t dev_work = (uint64_t)dev_blocks * threads * iterations;
@@ -1281,7 +1331,8 @@ int main() {
 
                 // Synchronize all GPUs and check for found using host-side flag
                 h_found_flag = 0;
-                for (int dev = 0; dev < device_count; dev++) {
+                for (int slot = 0; slot < selected_count; slot++) {
+                    int dev = selected_devices[slot];
                     CUDA_CHECK(cudaSetDevice(dev));
                     CUDA_CHECK(cudaDeviceSynchronize());
                     int dev_found = 0;
