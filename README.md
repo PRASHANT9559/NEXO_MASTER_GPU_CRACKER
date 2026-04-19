@@ -42,16 +42,17 @@ NEXO MASTER GPU CRACKER is a CUDA-accelerated password hash cracking tool design
 
 ## ✨ Features
 
-- **Multi-GPU Support** - Automatic load balancing across multiple GPUs
-- **Real-Time Statistics** - Progress bar, hash rate, ETA, peak performance
-- **Checkpoint System** - Resume from interruptions
-- **Potfile Support** - Skip already cracked hashes
-- **Three Attack Modes** - Brute-force, Dictionary, Mask
-- **Moving Average** - Smooth hash rate calculations
-- **Auto-Save** - Checkpoint every 5 minutes
-- **Benchmark Mode** - Test GPU performance
-- **12-Hour Limit** - Built-in safeguards
-- **Salted Hashes** - Support for salted variants
+- **Multi-GPU Support** - Automatic load balancing across multiple GPUs using asynchronous streams
+- **Hardware Monitoring** - Real-time monitoring of GPU temperature, power draw, and utilization (NVML)
+- **Auto-Tuning Engine** - Optimized performance for Maxwell, Pascal, Volta, Turing, Ampere, Ada, and Hopper architectures
+- **Real-Time Statistics** - Progress bar, hash rate, ETA, peak performance, and total processed
+- **Checkpoint System** - Automatic saving every 5 minutes and graceful resumption
+- **Potfile Support** - Skip already cracked hashes with persistent caching
+- **Four Attack Modes** - Brute-force, Dictionary, Mask, and Hybrid
+- **Moving Average** - Smooth hash rate calculations using a 10-point moving window
+- **Benchmark Mode** - Comprehensive speed testing for all supported hash types
+- **12-Hour Limit** - Built-in safety safeguards for long runs
+- **Salted Hashes** - Native support for various salted hash formats
 
 ---
 
@@ -205,7 +206,7 @@ Choice: 1  # For cracking a hash
 ```
 [4] Select Attack Mode:
     1. Brute-Force      2. Dictionary Attack
-    3. Mask Attack
+    3. Mask Attack      4. Hybrid Attack (Dictionary + Mask)
     Choice: 1
 ```
 
@@ -329,16 +330,40 @@ Test?d?d        → "Test" + 2 digits (e.g., Test12)
 **Performance:**
 - `?l?l?l?d?d`: 67.6 million combinations (~5 seconds)
 - `?u?l?l?l?l?d?d`: 3.2 billion combinations (~2-3 minutes)
-- `?a?a?a?a?a?a`: 67.6 billion combinations (~5-10 minutes)
-
 ---
+
+### 4. Hybrid Attack (Dictionary + Mask)
+
+Combines wordlist words with custom mask patterns (e.g., word + digits).
+
+**Syntax:**
+```
+Wordlist Path: /path/to/wordlist.txt
+Mask Pattern: ?d?d
+```
+
+**Example:**
+```
+[6] Enter Wordlist Path: company_names.txt
+[7] Enter Mask Pattern (e.g., ?d?d): ?d?d
+```
+*Result: Testing "Google01", "Apple99", etc.*
+
+**Best For:**
+- Passwords following "Word + Year" or "Name + Suffix" patterns
+- Targeted attacks on users known to use specific bases
+- Significantly faster than pure brute-force for large bases
+
+**Performance:**
+- Large Wordlist + `?d?d`: Near wordlist speed
+- Medium Wordlist + `?l?l?l`: Dependent on mask complexity
 
 ## 📊 Real-Time Statistics
 
 ### Display Format:
 ```
 [████████████████████████░░░░░░░░░░░░░░░░░░░░] 45.67%
-⚡ 12.5GH/s | 📈 11.8GH/s (avg) | 🔝 13.2GH/s (peak)  📊 2.18T/4.78T  ⏱️ 3m 45s elapsed | ⏳ 4m 32s ETA
+🌡️ 68°C | ⚡ 320W | 🌀 99%  ⚡ 12.5GH/s | 📈 11.8GH/s (avg) | 🔝 13.2GH/s (peak)  📊 2.18T/4.78T  ⏱️ 3m 45s elapsed | ⏳ 4m 32s ETA
 ```
 
 ### Components Explained:
