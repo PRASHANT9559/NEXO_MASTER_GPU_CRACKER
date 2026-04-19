@@ -1,7 +1,7 @@
 /*
  * NEXO MASTER GPU CRACKER v4.0
  * Optimized High-Performance Hash Cracker
- * Created by: Ramji
+ * Created by: PRASHANT
  */
 #include <stdio.h>
 #include <cuda_runtime.h>
@@ -1512,7 +1512,7 @@ int main() {
 
     printf("\n========================================\n");
     printf("   🚀 NEXO MASTER GPU CRACKER v4.0\n");
-    printf("   👤 CREATED BY: RAMJI\n");
+    printf("   👤 CREATED BY: PRASHANT\n");
     printf("========================================\n");
 
     // Register signal handlers
