@@ -12,7 +12,7 @@ __constant__ char c_charset[70];
 __constant__ char c_salt[64]; // Salt for salted hashes
 __constant__ char c_mask_pattern[64]; // Mask pattern (e.g., "?l?l?d?d")
 __constant__ char c_mask_charsets[10][128]; // Character sets for each mask position
-__device__ int c_charset_len;
+__constant__ int c_charset_len;
 __device__ int c_target_bytes;
 __device__ int c_salt_len;
 __device__ int c_mask_len;
@@ -60,11 +60,34 @@ __device__ void sha256_transform(uint32_t *state, const uint8_t *chunk) {
 __device__ void sha256_hash(const char *input, int len, uint8_t *output) {
     uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
     uint8_t chunk[64] = {0};
-    for(int i=0; i<len; i++) chunk[i] = (uint8_t)input[i];
-    chunk[len] = 0x80;
-    uint64_t bits = (uint64_t)len * 8;
-    for(int i=0;i<8;i++) chunk[63-i] = (bits >> (i*8)) & 0xFF;
-    sha256_transform(h, chunk);
+    
+    // Handle multi-block padding for inputs >= 56 bytes
+    if (len >= 56) {
+        // First block: copy as much as fits, add 0x80
+        for(int i=0; i<len && i<56; i++) chunk[i] = (uint8_t)input[i];
+        chunk[55] = 0x80;
+        // Zero out remaining bytes in first block (except last 8 for length)
+        for(int i=56; i<64; i++) chunk[i] = 0;
+        sha256_transform(h, chunk);
+        
+        // Second block: copy remaining input data
+        for(int i=0; i<64; i++) chunk[i] = 0;
+        int remaining = len - 55;
+        for(int i=0; i<remaining; i++) chunk[i] = (uint8_t)input[55 + i];
+        // Add 0x80 after remaining data
+        chunk[remaining] = 0x80;
+        // Set bit length at end
+        uint64_t bits = (uint64_t)len * 8;
+        for(int i=0;i<8;i++) chunk[63-i] = (bits >> (i*8)) & 0xFF;
+        sha256_transform(h, chunk);
+    } else {
+        // Single block case (original logic)
+        for(int i=0; i<len; i++) chunk[i] = (uint8_t)input[i];
+        chunk[len] = 0x80;
+        uint64_t bits = (uint64_t)len * 8;
+        for(int i=0;i<8;i++) chunk[63-i] = (bits >> (i*8)) & 0xFF;
+        sha256_transform(h, chunk);
+    }
     for(int i=0;i<8;i++) {
         output[i*4] = (h[i] >> 24) & 0xFF; output[i*4+1] = (h[i] >> 16) & 0xFF;
         output[i*4+2] = (h[i] >> 8) & 0xFF; output[i*4+3] = h[i] & 0xFF;
@@ -139,11 +162,219 @@ __device__ void sha1_hash(const char *input, int len, uint8_t *output) {
     out32[4] = __byte_perm(h4, 0, 0x0123);
 }
 
-// --- NTLM Engine (Simplified MD4) ---
+// --- MD4 Engine for NTLM ---
+__device__ void md4_hash(const char *input, int len, uint8_t *output) {
+    uint32_t a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
+    uint32_t W[16] = {0};
+    
+    // Copy input and add padding
+    for(int i=0; i<len; i++) ((uint8_t*)W)[i] = (uint8_t)input[i];
+    ((uint8_t*)W)[len] = 0x80;
+    
+    // Pad to 56 bytes (448 bits), then add 64-bit length
+    if (len < 56) {
+        for(int i=len+1; i<56; i++) ((uint8_t*)W)[i] = 0;
+    } else {
+        // Need two blocks - process first block then second
+        for(int i=len+1; i<64; i++) ((uint8_t*)W)[i] = 0;
+        
+        // Save original state
+        uint32_t AA = a, BB = b, CC = c, DD = d;
+        
+        // Round 1
+        #define MD4_F(x,y,z) (((x) & (y)) | ((~x) & (z)))
+        #define MD4_ROTL(x,n) (((x) << (n)) | ((x) >> (32-(n))))
+        
+        a = AA; b = BB; c = CC; d = DD;
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[0], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[1], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[2], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[3], 19);
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[4], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[5], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[6], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[7], 19);
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[8], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[9], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[10], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[11], 19);
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[12], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[13], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[14], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[15], 19);
+        
+        // Round 2
+        #define MD4_G(x,y,z) (((x) & (y)) | ((x) & (z)) | ((y) & (z)))
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[0] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[4] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[8] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[12] + 0x5a827999, 13);
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[1] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[5] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[9] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[13] + 0x5a827999, 13);
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[2] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[6] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[10] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[14] + 0x5a827999, 13);
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[3] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[7] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[11] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[15] + 0x5a827999, 13);
+        
+        // Round 3
+        #define MD4_H(x,y,z) ((x) ^ (y) ^ (z))
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[0] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[8] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[4] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[12] + 0x6ed9eba1, 15);
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[2] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[10] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[6] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[14] + 0x6ed9eba1, 15);
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[1] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[9] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[5] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[13] + 0x6ed9eba1, 15);
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[3] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[11] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[7] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[15] + 0x6ed9eba1, 15);
+        
+        AA += a; BB += b; CC += c; DD += d;
+        
+        // Second block - clear and set up
+        for(int i=0; i<16; i++) W[i] = 0;
+        int remaining = len - 55;
+        for(int i=0; i<remaining; i++) ((uint8_t*)W)[i] = ((uint8_t*)input)[55 + i];
+        ((uint8_t*)W)[remaining] = 0x80;
+        ((uint32_t*)W)[14] = (uint32_t)(len * 8);
+        
+        // Process second block with same rounds
+        a = AA; b = BB; c = CC; d = DD;
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[0], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[1], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[2], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[3], 19);
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[4], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[5], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[6], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[7], 19);
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[8], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[9], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[10], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[11], 19);
+        a = MD4_ROTL(a + MD4_F(b,c,d) + W[12], 3);
+        d = MD4_ROTL(d + MD4_F(a,b,c) + W[13], 7);
+        c = MD4_ROTL(c + MD4_F(d,a,b) + W[14], 11);
+        b = MD4_ROTL(b + MD4_F(c,d,a) + W[15], 19);
+        
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[0] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[4] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[8] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[12] + 0x5a827999, 13);
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[1] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[5] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[9] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[13] + 0x5a827999, 13);
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[2] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[6] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[10] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[14] + 0x5a827999, 13);
+        a = MD4_ROTL(a + MD4_G(b,c,d) + W[3] + 0x5a827999, 3);
+        d = MD4_ROTL(d + MD4_G(a,b,c) + W[7] + 0x5a827999, 5);
+        c = MD4_ROTL(c + MD4_G(d,a,b) + W[11] + 0x5a827999, 9);
+        b = MD4_ROTL(b + MD4_G(c,d,a) + W[15] + 0x5a827999, 13);
+        
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[0] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[8] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[4] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[12] + 0x6ed9eba1, 15);
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[2] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[10] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[6] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[14] + 0x6ed9eba1, 15);
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[1] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[9] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[5] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[13] + 0x6ed9eba1, 15);
+        a = MD4_ROTL(a + MD4_H(b,c,d) + W[3] + 0x6ed9eba1, 3);
+        d = MD4_ROTL(d + MD4_H(a,b,c) + W[11] + 0x6ed9eba1, 9);
+        c = MD4_ROTL(c + MD4_H(d,a,b) + W[7] + 0x6ed9eba1, 11);
+        b = MD4_ROTL(b + MD4_H(c,d,a) + W[15] + 0x6ed9eba1, 15);
+        
+        AA += a; BB += b; CC += c; DD += d;
+        a = AA; b = BB; c = CC; d = DD;
+    }
+    
+    // Round 1
+    #define MD4_F(x,y,z) (((x) & (y)) | ((~x) & (z)))
+    #define MD4_ROTL(x,n) (((x) << (n)) | ((x) >> (32-(n))))
+    
+    a = MD4_ROTL(a + MD4_F(b,c,d) + W[0], 3);
+    d = MD4_ROTL(d + MD4_F(a,b,c) + W[1], 7);
+    c = MD4_ROTL(c + MD4_F(d,a,b) + W[2], 11);
+    b = MD4_ROTL(b + MD4_F(c,d,a) + W[3], 19);
+    a = MD4_ROTL(a + MD4_F(b,c,d) + W[4], 3);
+    d = MD4_ROTL(d + MD4_F(a,b,c) + W[5], 7);
+    c = MD4_ROTL(c + MD4_F(d,a,b) + W[6], 11);
+    b = MD4_ROTL(b + MD4_F(c,d,a) + W[7], 19);
+    a = MD4_ROTL(a + MD4_F(b,c,d) + W[8], 3);
+    d = MD4_ROTL(d + MD4_F(a,b,c) + W[9], 7);
+    c = MD4_ROTL(c + MD4_F(d,a,b) + W[10], 11);
+    b = MD4_ROTL(b + MD4_F(c,d,a) + W[11], 19);
+    a = MD4_ROTL(a + MD4_F(b,c,d) + W[12], 3);
+    d = MD4_ROTL(d + MD4_F(a,b,c) + W[13], 7);
+    c = MD4_ROTL(c + MD4_F(d,a,b) + W[14], 11);
+    b = MD4_ROTL(b + MD4_F(c,d,a) + W[15], 19);
+    
+    // Round 2
+    #define MD4_G(x,y,z) (((x) & (y)) | ((x) & (z)) | ((y) & (z)))
+    a = MD4_ROTL(a + MD4_G(b,c,d) + W[0] + 0x5a827999, 3);
+    d = MD4_ROTL(d + MD4_G(a,b,c) + W[4] + 0x5a827999, 5);
+    c = MD4_ROTL(c + MD4_G(d,a,b) + W[8] + 0x5a827999, 9);
+    b = MD4_ROTL(b + MD4_G(c,d,a) + W[12] + 0x5a827999, 13);
+    a = MD4_ROTL(a + MD4_G(b,c,d) + W[1] + 0x5a827999, 3);
+    d = MD4_ROTL(d + MD4_G(a,b,c) + W[5] + 0x5a827999, 5);
+    c = MD4_ROTL(c + MD4_G(d,a,b) + W[9] + 0x5a827999, 9);
+    b = MD4_ROTL(b + MD4_G(c,d,a) + W[13] + 0x5a827999, 13);
+    a = MD4_ROTL(a + MD4_G(b,c,d) + W[2] + 0x5a827999, 3);
+    d = MD4_ROTL(d + MD4_G(a,b,c) + W[6] + 0x5a827999, 5);
+    c = MD4_ROTL(c + MD4_G(d,a,b) + W[10] + 0x5a827999, 9);
+    b = MD4_ROTL(b + MD4_G(c,d,a) + W[14] + 0x5a827999, 13);
+    a = MD4_ROTL(a + MD4_G(b,c,d) + W[3] + 0x5a827999, 3);
+    d = MD4_ROTL(d + MD4_G(a,b,c) + W[7] + 0x5a827999, 5);
+    c = MD4_ROTL(c + MD4_G(d,a,b) + W[11] + 0x5a827999, 9);
+    b = MD4_ROTL(b + MD4_G(c,d,a) + W[15] + 0x5a827999, 13);
+    
+    // Round 3
+    #define MD4_H(x,y,z) ((x) ^ (y) ^ (z))
+    a = MD4_ROTL(a + MD4_H(b,c,d) + W[0] + 0x6ed9eba1, 3);
+    d = MD4_ROTL(d + MD4_H(a,b,c) + W[8] + 0x6ed9eba1, 9);
+    c = MD4_ROTL(c + MD4_H(d,a,b) + W[4] + 0x6ed9eba1, 11);
+    b = MD4_ROTL(b + MD4_H(c,d,a) + W[12] + 0x6ed9eba1, 15);
+    a = MD4_ROTL(a + MD4_H(b,c,d) + W[2] + 0x6ed9eba1, 3);
+    d = MD4_ROTL(d + MD4_H(a,b,c) + W[10] + 0x6ed9eba1, 9);
+    c = MD4_ROTL(c + MD4_H(d,a,b) + W[6] + 0x6ed9eba1, 11);
+    b = MD4_ROTL(b + MD4_H(c,d,a) + W[14] + 0x6ed9eba1, 15);
+    a = MD4_ROTL(a + MD4_H(b,c,d) + W[1] + 0x6ed9eba1, 3);
+    d = MD4_ROTL(d + MD4_H(a,b,c) + W[9] + 0x6ed9eba1, 9);
+    c = MD4_ROTL(c + MD4_H(d,a,b) + W[5] + 0x6ed9eba1, 11);
+    b = MD4_ROTL(b + MD4_H(c,d,a) + W[13] + 0x6ed9eba1, 15);
+    a = MD4_ROTL(a + MD4_H(b,c,d) + W[3] + 0x6ed9eba1, 3);
+    d = MD4_ROTL(d + MD4_H(a,b,c) + W[11] + 0x6ed9eba1, 9);
+    c = MD4_ROTL(c + MD4_H(d,a,b) + W[7] + 0x6ed9eba1, 11);
+    b = MD4_ROTL(b + MD4_H(c,d,a) + W[15] + 0x6ed9eba1, 15);
+    
+    uint32_t* out32 = (uint32_t*)output;
+    out32[0] = a; out32[1] = b; out32[2] = c; out32[3] = d;
+}
+
+// --- NTLM Engine (uses MD4) ---
 __device__ void ntlm_hash(const char *input, int len, uint8_t *output) {
-    uint8_t unicode[32] = {0};
-    for(int i=0; i<len; i++) { unicode[i*2] = input[i]; unicode[i*2+1] = 0; }
-    md5_hash((char*)unicode, len*2, output); // Note: Simplified as MD4 and MD5 share structures.
+    uint8_t unicode[256] = {0};
+    for(int i=0; i<len && i<128; i++) { unicode[i*2] = input[i]; unicode[i*2+1] = 0; }
+    md4_hash((char*)unicode, len*2, output);
 }
 
 // --- Salted Hash Functions ---
@@ -171,9 +402,12 @@ __device__ void sha256_pass_salt_hash(const char *input, int len, uint8_t *outpu
     sha256_hash(combined, len + salt_len, output);
 }
 
-// --- Global Result State ---
+// --- Global Result State (per-device for multi-GPU) ---
 __device__ int d_found = 0;
 __device__ char d_result[32];
+
+// Host-side flag for multi-GPU synchronization
+static int h_found_flag = 0;
 
 // --- Checkpoint State ---
 typedef struct {
@@ -193,12 +427,26 @@ typedef struct {
 } CheckpointState;
 
 // --- Real-time Stats ---
+
+// --- Improved Real-time Stats ---
 typedef struct {
-    uint64_t hashes_per_second;
-    double eta_seconds;
-    double progress_percent;
-    time_t last_update;
+    uint64_t current_hashes;
     uint64_t total_hashes;
+    uint64_t hashes_per_second;
+    uint64_t avg_hashes_per_second;
+    uint64_t peak_hashes_per_second;
+    double progress_percent;
+    double eta_seconds;
+    time_t start_time;
+    time_t last_update;
+    uint64_t last_hashes;
+
+    // Moving average for smooth H/s
+    double hps_history[10];
+    int hps_history_idx;
+
+    // Progress bar state
+    int bar_width;
 } StatsState;
 
 void saveCheckpoint(const char* filename, CheckpointState* state) {
@@ -249,27 +497,6 @@ void addToPotfile(const char* potfile_path, const char* hash, const char* passwo
         printf("\n💾 Saved to potfile: %s\n", potfile_path);
     }
 }
-
-// --- Improved Real-time Stats ---
-typedef struct {
-    uint64_t current_hashes;
-    uint64_t total_hashes;
-    uint64_t hashes_per_second;
-    uint64_t avg_hashes_per_second;
-    uint64_t peak_hashes_per_second;
-    double progress_percent;
-    double eta_seconds;
-    time_t start_time;
-    time_t last_update;
-    uint64_t last_hashes;
-
-    // Moving average for smooth H/s
-    double hps_history[10];
-    int hps_history_idx;
-
-    // Progress bar state
-    int bar_width;
-} StatsState;
 
 void initStats(StatsState* stats, uint64_t total_hashes, time_t start_time) {
     memset(stats, 0, sizeof(StatsState));
@@ -875,8 +1102,6 @@ int main() {
         uint64_t batch_size = (uint64_t)blocks * threads * iterations;
         time_t wall_start = time(NULL); uint64_t total_scanned = 0;
         time_t last_checkpoint = time(NULL);
-        StatsState stats;
-        initStats(&stats, max_idx, wall_start);
 
         // Multi-GPU Support
         int device_count;
@@ -897,6 +1122,9 @@ int main() {
             uint64_t offset = (len == start_len) ? start_offset : 0;
             total_scanned = (len == start_len) ? start_total : total_scanned;
 
+            StatsState stats;
+            initStats(&stats, max_idx, wall_start);
+
             while (offset < max_idx) {
                 if (difftime(time(NULL), wall_start) > 43200 || (fixed_limit > 0 && total_scanned >= fixed_limit)) break;
 
@@ -907,12 +1135,15 @@ int main() {
                     crackKernel<<<blocks / device_count, threads>>>(dev_offset, len, iterations, hash_choice);
                 }
 
-                // Synchronize all GPUs
+                // Synchronize all GPUs and check for found using host-side flag
+                h_found_flag = 0;
                 for (int dev = 0; dev < device_count; dev++) {
                     cudaSetDevice(dev);
                     cudaDeviceSynchronize();
-                    cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int));
-                    if (h_found) {
+                    int dev_found = 0;
+                    cudaMemcpyFromSymbol(&dev_found, d_found, sizeof(int));
+                    if (dev_found) {
+                        h_found_flag = 1;
                         char res[32];
                         cudaMemcpyFromSymbol(res, d_result, 32);
                         printf("\n\n🎉 FOUND! Password: %s (GPU %d)\n", res, dev);
