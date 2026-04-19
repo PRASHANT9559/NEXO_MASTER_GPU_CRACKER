@@ -1,5 +1,8 @@
-
-+++ NEXO_MASTER_GPU_CRACKER.cu
+/*
+ * NEXO MASTER GPU CRACKER v4.0
+ * Optimized High-Performance Hash Cracker
+ * Created by: Ramji
+ */
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <stdlib.h>
@@ -8,14 +11,26 @@
 #include <stdint.h>
 #include <sys/stat.h>
 #include <signal.h>
+#include <nvml.h>
 
+// --- CUDA Error Checking Infrastructure ---
 #define CUDA_CHECK(call) do { \
-    cudaError_t _err = (call); \
-    if (_err != cudaSuccess) { \
-        fprintf(stderr, "\n❌ CUDA Error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_err)); \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "[CUDA ERROR] %s at %s:%d - %s\n", \
+                cudaGetErrorString(err), __FILE__, __LINE__, #call); \
         exit(EXIT_FAILURE); \
     } \
-} while (0)
+} while(0)
+
+#define KERNEL_CHECK() do { \
+    cudaError_t err = cudaGetLastError(); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "[KERNEL ERROR] %s at %s:%d\n", \
+                cudaGetErrorString(err), __FILE__, __LINE__); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
 
 // --- Constant Memory ---
 __constant__ uint8_t c_target[32];
@@ -23,7 +38,18 @@ __constant__ char c_charset[70];
 __constant__ char c_salt[64]; // Salt for salted hashes
 __constant__ char c_mask_pattern[64]; // Mask pattern (e.g., "?l?l?d?d")
 __constant__ char c_mask_charsets[10][128]; // Character sets for each mask position
-__constant__ int c_charset_len;
+// Updated: Move K256 to constant memory for faster access
+__constant__ uint32_t K256[64] = {
+    0x428a2f98,0x71374498,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
+    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
+    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
+    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
+    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
+    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
+    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
+    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
+};
+__device__ int c_charset_len;
 __device__ int c_target_bytes;
 __device__ int c_salt_len;
 __device__ int c_mask_len;
@@ -44,24 +70,34 @@ __device__ __forceinline__ uint32_t ep1(uint32_t x) { return rotr(x,6) ^ rotr(x,
 __device__ __forceinline__ uint32_t sig0(uint32_t x) { return rotr(x,7) ^ rotr(x,18) ^ (x >> 3); }
 __device__ __forceinline__ uint32_t sig1(uint32_t x) { return rotr(x,17) ^ rotr(x,19) ^ (x >> 10); }
 
-__device__ const uint32_t K256[64] = {
-    0x428a2f98,0x71374498,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,
-    0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,
-    0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,
-    0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,
-    0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,
-    0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,
-    0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,
-    0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2
-};
+// Replaced: Old K256 moved to constant memory above
+// __device__ const uint32_t K256[64] = { ... };
 
 __device__ void sha256_transform(uint32_t *state, const uint8_t *chunk) {
-    uint32_t W[64], a,b,c,d,e,f,g,h,i,T1,T2;
-    for(i=0;i<16;i++) W[i] = (chunk[i*4]<<24)|(chunk[i*4+1]<<16)|(chunk[i*4+2]<<8)|chunk[i*4+3];
-    for(i=16;i<64;i++) W[i] = sig1(W[i-2]) + W[i-7] + sig0(W[i-15]) + W[i-16];
+    uint32_t W[16]; // Only keep 16 words at a time, compute on-the-fly
+    uint32_t a,b,c,d,e,f,g,h,i,T1,T2;
+
+    // Load first 16 words with warp shuffle optimization (FIXED: Commented out to prevent 32x slowdown)
+    // int lane_id = threadIdx.x % 32;
+    for(i=0;i<16;i++) {
+        uint32_t word = (chunk[i*4]<<24)|(chunk[i*4+1]<<16)|(chunk[i*4+2]<<8)|chunk[i*4+3];
+        // word = __shfl_sync(0xFFFFFFFF, word, 0); // DISABLED: Each thread has a different candidate!
+        W[i] = word;
+    }
+
     a=state[0];b=state[1];c=state[2];d=state[3];e=state[4];f=state[5];g=state[6];h=state[7];
+
     for(i=0;i<64;i++){
-        T1 = h + ep1(e) + ch(e,f,g) + K256[i] + W[i];
+        // Compute W[i] on-the-fly if needed
+        if(i >= 16) {
+            uint32_t w0 = W[(i-3)&0xF];
+            uint32_t w1 = W[(i-8)&0xF];
+            uint32_t w2 = W[(i-14)&0xF];
+            uint32_t w3 = W[(i-16)&0xF];
+            W[i&0xF] = sig1(w0) + w1 + sig0(w2) + w3;
+        }
+
+        T1 = h + ep1(e) + ch(e,f,g) + K256[i] + W[i&0xF];
         T2 = ep0(a) + maj(a,b,c);
         h=g;g=f;f=e;e=d+T1;d=c;c=b;b=a;a=T1+T2;
     }
@@ -70,35 +106,39 @@ __device__ void sha256_transform(uint32_t *state, const uint8_t *chunk) {
 
 __device__ void sha256_hash(const char *input, int len, uint8_t *output) {
     uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
-    uint8_t chunk[64] = {0};
+    uint64_t total_bits = (uint64_t)len * 8;
+    uint64_t chunk_count = (len + 8 + 64) / 64; // +8 for 0x80, +56 for length
 
-    // Handle multi-block padding for inputs >= 56 bytes
-    if (len >= 56) {
-        // First block: copy as much as fits, add 0x80
-        for(int i=0; i<len && i<56; i++) chunk[i] = (uint8_t)input[i];
-        chunk[55] = 0x80;
-        // Zero out remaining bytes in first block (except last 8 for length)
-        for(int i=56; i<64; i++) chunk[i] = 0;
-        sha256_transform(h, chunk);
+    for (uint64_t chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
+        uint8_t chunk[64] = {0};
+        uint64_t chunk_offset = chunk_idx * 64;
 
-        // Second block: copy remaining input data
-        for(int i=0; i<64; i++) chunk[i] = 0;
-        int remaining = len - 55;
-        for(int i=0; i<remaining; i++) chunk[i] = (uint8_t)input[55 + i];
-        // Add 0x80 after remaining data
-        chunk[remaining] = 0x80;
-        // Set bit length at end
-        uint64_t bits = (uint64_t)len * 8;
-        for(int i=0;i<8;i++) chunk[63-i] = (bits >> (i*8)) & 0xFF;
-        sha256_transform(h, chunk);
-    } else {
-        // Single block case (original logic)
-        for(int i=0; i<len; i++) chunk[i] = (uint8_t)input[i];
-        chunk[len] = 0x80;
-        uint64_t bits = (uint64_t)len * 8;
-        for(int i=0;i<8;i++) chunk[63-i] = (bits >> (i*8)) & 0xFF;
+        // Fill chunk with input data
+        for (int i = 0; i < 64; i++) {
+            uint64_t input_pos = chunk_offset + i;
+            if (input_pos < (uint64_t)len) {
+                chunk[i] = (uint8_t)input[input_pos];
+            } else if (input_pos == (uint64_t)len) {
+                chunk[i] = 0x80; // Append 1 bit
+                break;
+            }
+        }
+
+        // Last chunk: add length in bits (big-endian, 8 bytes at end)
+        if (chunk_idx == chunk_count - 1) {
+            chunk[56] = (total_bits >> 56) & 0xFF;
+            chunk[57] = (total_bits >> 48) & 0xFF;
+            chunk[58] = (total_bits >> 40) & 0xFF;
+            chunk[59] = (total_bits >> 32) & 0xFF;
+            chunk[60] = (total_bits >> 24) & 0xFF;
+            chunk[61] = (total_bits >> 16) & 0xFF;
+            chunk[62] = (total_bits >> 8) & 0xFF;
+            chunk[63] = total_bits & 0xFF;
+        }
+
         sha256_transform(h, chunk);
     }
+
     for(int i=0;i<8;i++) {
         output[i*4] = (h[i] >> 24) & 0xFF; output[i*4+1] = (h[i] >> 16) & 0xFF;
         output[i*4+2] = (h[i] >> 8) & 0xFF; output[i*4+3] = h[i] & 0xFF;
@@ -173,219 +213,104 @@ __device__ void sha1_hash(const char *input, int len, uint8_t *output) {
     out32[4] = __byte_perm(h4, 0, 0x0123);
 }
 
-// --- MD4 Engine for NTLM ---
-__device__ void md4_hash(const char *input, int len, uint8_t *output) {
-    uint32_t a = 0x67452301, b = 0xefcdab89, c = 0x98badcfe, d = 0x10325476;
-    uint32_t W[16] = {0};
+// --- NTLM Engine (Proper MD4) ---
+__device__ uint32_t md4_F(uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (~x & z); }
+__device__ uint32_t md4_G(uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (x & z) | (y & z); }
+__device__ uint32_t md4_H(uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z; }
 
-    // Copy input and add padding
-    for(int i=0; i<len; i++) ((uint8_t*)W)[i] = (uint8_t)input[i];
-    ((uint8_t*)W)[len] = 0x80;
+__device__ uint32_t ROTL(uint32_t x, uint32_t n) { return (x << n) | (x >> (32 - n)); }
 
-    // Pad to 56 bytes (448 bits), then add 64-bit length
-    if (len < 56) {
-        for(int i=len+1; i<56; i++) ((uint8_t*)W)[i] = 0;
-    } else {
-        // Need two blocks - process first block then second
-        for(int i=len+1; i<64; i++) ((uint8_t*)W)[i] = 0;
+__device__ void md4_transform(uint32_t *state, const uint8_t *chunk) {
+    uint32_t W[16];
+    for(int i=0; i<16; i++) W[i] = chunk[i*4] | (chunk[i*4+1] << 8) | (chunk[i*4+2] << 16) | (chunk[i*4+3] << 24);
 
-        // Save original state
-        uint32_t AA = a, BB = b, CC = c, DD = d;
-
-        // Round 1
-        #define MD4_F(x,y,z) (((x) & (y)) | ((~x) & (z)))
-        #define MD4_ROTL(x,n) (((x) << (n)) | ((x) >> (32-(n))))
-
-        a = AA; b = BB; c = CC; d = DD;
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[0], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[1], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[2], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[3], 19);
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[4], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[5], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[6], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[7], 19);
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[8], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[9], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[10], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[11], 19);
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[12], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[13], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[14], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[15], 19);
-
-        // Round 2
-        #define MD4_G(x,y,z) (((x) & (y)) | ((x) & (z)) | ((y) & (z)))
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[0] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[4] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[8] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[12] + 0x5a827999, 13);
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[1] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[5] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[9] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[13] + 0x5a827999, 13);
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[2] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[6] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[10] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[14] + 0x5a827999, 13);
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[3] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[7] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[11] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[15] + 0x5a827999, 13);
-
-        // Round 3
-        #define MD4_H(x,y,z) ((x) ^ (y) ^ (z))
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[0] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[8] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[4] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[12] + 0x6ed9eba1, 15);
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[2] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[10] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[6] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[14] + 0x6ed9eba1, 15);
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[1] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[9] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[5] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[13] + 0x6ed9eba1, 15);
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[3] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[11] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[7] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[15] + 0x6ed9eba1, 15);
-
-        AA += a; BB += b; CC += c; DD += d;
-
-        // Second block - clear and set up
-        for(int i=0; i<16; i++) W[i] = 0;
-        int remaining = len - 55;
-        for(int i=0; i<remaining; i++) ((uint8_t*)W)[i] = ((uint8_t*)input)[55 + i];
-        ((uint8_t*)W)[remaining] = 0x80;
-        ((uint32_t*)W)[14] = (uint32_t)(len * 8);
-
-        // Process second block with same rounds
-        a = AA; b = BB; c = CC; d = DD;
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[0], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[1], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[2], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[3], 19);
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[4], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[5], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[6], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[7], 19);
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[8], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[9], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[10], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[11], 19);
-        a = MD4_ROTL(a + MD4_F(b,c,d) + W[12], 3);
-        d = MD4_ROTL(d + MD4_F(a,b,c) + W[13], 7);
-        c = MD4_ROTL(c + MD4_F(d,a,b) + W[14], 11);
-        b = MD4_ROTL(b + MD4_F(c,d,a) + W[15], 19);
-
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[0] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[4] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[8] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[12] + 0x5a827999, 13);
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[1] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[5] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[9] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[13] + 0x5a827999, 13);
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[2] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[6] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[10] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[14] + 0x5a827999, 13);
-        a = MD4_ROTL(a + MD4_G(b,c,d) + W[3] + 0x5a827999, 3);
-        d = MD4_ROTL(d + MD4_G(a,b,c) + W[7] + 0x5a827999, 5);
-        c = MD4_ROTL(c + MD4_G(d,a,b) + W[11] + 0x5a827999, 9);
-        b = MD4_ROTL(b + MD4_G(c,d,a) + W[15] + 0x5a827999, 13);
-
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[0] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[8] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[4] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[12] + 0x6ed9eba1, 15);
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[2] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[10] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[6] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[14] + 0x6ed9eba1, 15);
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[1] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[9] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[5] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[13] + 0x6ed9eba1, 15);
-        a = MD4_ROTL(a + MD4_H(b,c,d) + W[3] + 0x6ed9eba1, 3);
-        d = MD4_ROTL(d + MD4_H(a,b,c) + W[11] + 0x6ed9eba1, 9);
-        c = MD4_ROTL(c + MD4_H(d,a,b) + W[7] + 0x6ed9eba1, 11);
-        b = MD4_ROTL(b + MD4_H(c,d,a) + W[15] + 0x6ed9eba1, 15);
-
-        AA += a; BB += b; CC += c; DD += d;
-        a = AA; b = BB; c = CC; d = DD;
-    }
+    uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
 
     // Round 1
-    #define MD4_F(x,y,z) (((x) & (y)) | ((~x) & (z)))
-    #define MD4_ROTL(x,n) (((x) << (n)) | ((x) >> (32-(n))))
-
-    a = MD4_ROTL(a + MD4_F(b,c,d) + W[0], 3);
-    d = MD4_ROTL(d + MD4_F(a,b,c) + W[1], 7);
-    c = MD4_ROTL(c + MD4_F(d,a,b) + W[2], 11);
-    b = MD4_ROTL(b + MD4_F(c,d,a) + W[3], 19);
-    a = MD4_ROTL(a + MD4_F(b,c,d) + W[4], 3);
-    d = MD4_ROTL(d + MD4_F(a,b,c) + W[5], 7);
-    c = MD4_ROTL(c + MD4_F(d,a,b) + W[6], 11);
-    b = MD4_ROTL(b + MD4_F(c,d,a) + W[7], 19);
-    a = MD4_ROTL(a + MD4_F(b,c,d) + W[8], 3);
-    d = MD4_ROTL(d + MD4_F(a,b,c) + W[9], 7);
-    c = MD4_ROTL(c + MD4_F(d,a,b) + W[10], 11);
-    b = MD4_ROTL(b + MD4_F(c,d,a) + W[11], 19);
-    a = MD4_ROTL(a + MD4_F(b,c,d) + W[12], 3);
-    d = MD4_ROTL(d + MD4_F(a,b,c) + W[13], 7);
-    c = MD4_ROTL(c + MD4_F(d,a,b) + W[14], 11);
-    b = MD4_ROTL(b + MD4_F(c,d,a) + W[15], 19);
+    a = ROTL((a + md4_F(b, c, d) + W[0]), 3);  d = ROTL((d + md4_F(a, b, c) + W[1]), 7);
+    c = ROTL((c + md4_F(d, a, b) + W[2]), 11); b = ROTL((b + md4_F(c, d, a) + W[3]), 19);
+    a = ROTL((a + md4_F(b, c, d) + W[4]), 3);  d = ROTL((d + md4_F(a, b, c) + W[5]), 7);
+    c = ROTL((c + md4_F(d, a, b) + W[6]), 11); b = ROTL((b + md4_F(c, d, a) + W[7]), 19);
+    a = ROTL((a + md4_F(b, c, d) + W[8]), 3);  d = ROTL((d + md4_F(a, b, c) + W[9]), 7);
+    c = ROTL((c + md4_F(d, a, b) + W[10]), 11); b = ROTL((b + md4_F(c, d, a) + W[11]), 19);
+    a = ROTL((a + md4_F(b, c, d) + W[12]), 3);  d = ROTL((d + md4_F(a, b, c) + W[13]), 7);
+    c = ROTL((c + md4_F(d, a, b) + W[14]), 11); b = ROTL((b + md4_F(c, d, a) + W[15]), 19);
 
     // Round 2
-    #define MD4_G(x,y,z) (((x) & (y)) | ((x) & (z)) | ((y) & (z)))
-    a = MD4_ROTL(a + MD4_G(b,c,d) + W[0] + 0x5a827999, 3);
-    d = MD4_ROTL(d + MD4_G(a,b,c) + W[4] + 0x5a827999, 5);
-    c = MD4_ROTL(c + MD4_G(d,a,b) + W[8] + 0x5a827999, 9);
-    b = MD4_ROTL(b + MD4_G(c,d,a) + W[12] + 0x5a827999, 13);
-    a = MD4_ROTL(a + MD4_G(b,c,d) + W[1] + 0x5a827999, 3);
-    d = MD4_ROTL(d + MD4_G(a,b,c) + W[5] + 0x5a827999, 5);
-    c = MD4_ROTL(c + MD4_G(d,a,b) + W[9] + 0x5a827999, 9);
-    b = MD4_ROTL(b + MD4_G(c,d,a) + W[13] + 0x5a827999, 13);
-    a = MD4_ROTL(a + MD4_G(b,c,d) + W[2] + 0x5a827999, 3);
-    d = MD4_ROTL(d + MD4_G(a,b,c) + W[6] + 0x5a827999, 5);
-    c = MD4_ROTL(c + MD4_G(d,a,b) + W[10] + 0x5a827999, 9);
-    b = MD4_ROTL(b + MD4_G(c,d,a) + W[14] + 0x5a827999, 13);
-    a = MD4_ROTL(a + MD4_G(b,c,d) + W[3] + 0x5a827999, 3);
-    d = MD4_ROTL(d + MD4_G(a,b,c) + W[7] + 0x5a827999, 5);
-    c = MD4_ROTL(c + MD4_G(d,a,b) + W[11] + 0x5a827999, 9);
-    b = MD4_ROTL(b + MD4_G(c,d,a) + W[15] + 0x5a827999, 13);
+    a = ROTL((a + md4_G(b, c, d) + W[0] + 0x5a827999), 3);  d = ROTL((d + md4_G(a, b, c) + W[4] + 0x5a827999), 5);
+    c = ROTL((c + md4_G(d, a, b) + W[8] + 0x5a827999), 9);  b = ROTL((b + md4_G(c, d, a) + W[12] + 0x5a827999), 13);
+    a = ROTL((a + md4_G(b, c, d) + W[1] + 0x5a827999), 3);  d = ROTL((d + md4_G(a, b, c) + W[5] + 0x5a827999), 5);
+    c = ROTL((c + md4_G(d, a, b) + W[9] + 0x5a827999), 9);  b = ROTL((b + md4_G(c, d, a) + W[13] + 0x5a827999), 13);
+    a = ROTL((a + md4_G(b, c, d) + W[2] + 0x5a827999), 3);  d = ROTL((d + md4_G(a, b, c) + W[6] + 0x5a827999), 5);
+    c = ROTL((c + md4_G(d, a, b) + W[10] + 0x5a827999), 9); b = ROTL((b + md4_G(c, d, a) + W[14] + 0x5a827999), 13);
+    a = ROTL((a + md4_G(b, c, d) + W[3] + 0x5a827999), 3);  d = ROTL((d + md4_G(a, b, c) + W[7] + 0x5a827999), 5);
+    c = ROTL((c + md4_G(d, a, b) + W[11] + 0x5a827999), 9); b = ROTL((b + md4_G(c, d, a) + W[15] + 0x5a827999), 13);
 
     // Round 3
-    #define MD4_H(x,y,z) ((x) ^ (y) ^ (z))
-    a = MD4_ROTL(a + MD4_H(b,c,d) + W[0] + 0x6ed9eba1, 3);
-    d = MD4_ROTL(d + MD4_H(a,b,c) + W[8] + 0x6ed9eba1, 9);
-    c = MD4_ROTL(c + MD4_H(d,a,b) + W[4] + 0x6ed9eba1, 11);
-    b = MD4_ROTL(b + MD4_H(c,d,a) + W[12] + 0x6ed9eba1, 15);
-    a = MD4_ROTL(a + MD4_H(b,c,d) + W[2] + 0x6ed9eba1, 3);
-    d = MD4_ROTL(d + MD4_H(a,b,c) + W[10] + 0x6ed9eba1, 9);
-    c = MD4_ROTL(c + MD4_H(d,a,b) + W[6] + 0x6ed9eba1, 11);
-    b = MD4_ROTL(b + MD4_H(c,d,a) + W[14] + 0x6ed9eba1, 15);
-    a = MD4_ROTL(a + MD4_H(b,c,d) + W[1] + 0x6ed9eba1, 3);
-    d = MD4_ROTL(d + MD4_H(a,b,c) + W[9] + 0x6ed9eba1, 9);
-    c = MD4_ROTL(c + MD4_H(d,a,b) + W[5] + 0x6ed9eba1, 11);
-    b = MD4_ROTL(b + MD4_H(c,d,a) + W[13] + 0x6ed9eba1, 15);
-    a = MD4_ROTL(a + MD4_H(b,c,d) + W[3] + 0x6ed9eba1, 3);
-    d = MD4_ROTL(d + MD4_H(a,b,c) + W[11] + 0x6ed9eba1, 9);
-    c = MD4_ROTL(c + MD4_H(d,a,b) + W[7] + 0x6ed9eba1, 11);
-    b = MD4_ROTL(b + MD4_H(c,d,a) + W[15] + 0x6ed9eba1, 15);
+    a = ROTL((a + md4_H(b, c, d) + W[0] + 0x6ed9eba1), 3);  d = ROTL((d + md4_H(a, b, c) + W[8] + 0x6ed9eba1), 9);
+    c = ROTL((c + md4_H(d, a, b) + W[4] + 0x6ed9eba1), 11); b = ROTL((b + md4_H(c, d, a) + W[12] + 0x6ed9eba1), 15);
+    a = ROTL((a + md4_H(b, c, d) + W[2] + 0x6ed9eba1), 3);  d = ROTL((d + md4_H(a, b, c) + W[10] + 0x6ed9eba1), 9);
+    c = ROTL((c + md4_H(d, a, b) + W[6] + 0x6ed9eba1), 11); b = ROTL((b + md4_H(c, d, a) + W[14] + 0x6ed9eba1), 15);
+    a = ROTL((a + md4_H(b, c, d) + W[1] + 0x6ed9eba1), 3);  d = ROTL((d + md4_H(a, b, c) + W[9] + 0x6ed9eba1), 9);
+    c = ROTL((c + md4_H(d, a, b) + W[5] + 0x6ed9eba1), 11); b = ROTL((b + md4_H(c, d, a) + W[13] + 0x6ed9eba1), 15);
+    a = ROTL((a + md4_H(b, c, d) + W[3] + 0x6ed9eba1), 3);  d = ROTL((d + md4_H(a, b, c) + W[11] + 0x6ed9eba1), 9);
+    c = ROTL((c + md4_H(d, a, b) + W[7] + 0x6ed9eba1), 11); b = ROTL((b + md4_H(c, d, a) + W[15] + 0x6ed9eba1), 15);
 
-    uint32_t* out32 = (uint32_t*)output;
-    out32[0] = a; out32[1] = b; out32[2] = c; out32[3] = d;
+    state[0] += a; state[1] += b; state[2] += c; state[3] += d;
 }
 
-// --- NTLM Engine (uses MD4) ---
+__device__ void md4_hash(const char *input, int len, uint8_t *output) {
+    uint32_t h[4] = {0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476};
+
+    // Convert to UTF-16LE for NTLM
+    uint8_t utf16[128] = {0};
+    for(int i=0; i<len; i++) {
+        utf16[i*2] = input[i];
+        utf16[i*2+1] = 0;
+    }
+    int utf16_len = len * 2;
+
+    uint64_t total_bits = (uint64_t)utf16_len * 8;
+    uint64_t chunk_count = (utf16_len + 8 + 64) / 64;
+
+    for (uint64_t chunk_idx = 0; chunk_idx < chunk_count; chunk_idx++) {
+        uint8_t chunk[64] = {0};
+        uint64_t chunk_offset = chunk_idx * 64;
+
+        for (int i = 0; i < 64; i++) {
+            uint64_t input_pos = chunk_offset + i;
+            if (input_pos < (uint64_t)utf16_len) {
+                chunk[i] = utf16[input_pos];
+            } else if (input_pos == (uint64_t)utf16_len) {
+                chunk[i] = 0x80;
+                break;
+            }
+        }
+
+        if (chunk_idx == chunk_count - 1) {
+            chunk[56] = (total_bits >> 56) & 0xFF;
+            chunk[57] = (total_bits >> 48) & 0xFF;
+            chunk[58] = (total_bits >> 40) & 0xFF;
+            chunk[59] = (total_bits >> 32) & 0xFF;
+            chunk[60] = (total_bits >> 24) & 0xFF;
+            chunk[61] = (total_bits >> 16) & 0xFF;
+            chunk[62] = (total_bits >> 8) & 0xFF;
+            chunk[63] = total_bits & 0xFF;
+        }
+
+        md4_transform(h, chunk);
+    }
+
+    for(int i=0; i<4; i++) {
+        output[i*4] = h[i] & 0xFF;
+        output[i*4+1] = (h[i] >> 8) & 0xFF;
+        output[i*4+2] = (h[i] >> 16) & 0xFF;
+        output[i*4+3] = (h[i] >> 24) & 0xFF;
+    }
+}
+
 __device__ void ntlm_hash(const char *input, int len, uint8_t *output) {
-    uint8_t unicode[256] = {0};
-    for(int i=0; i<len && i<128; i++) { unicode[i*2] = input[i]; unicode[i*2+1] = 0; }
-    md4_hash((char*)unicode, len*2, output);
+    md4_hash(input, len, output);
 }
 
 // --- Salted Hash Functions ---
@@ -413,13 +338,9 @@ __device__ void sha256_pass_salt_hash(const char *input, int len, uint8_t *outpu
     sha256_hash(combined, len + salt_len, output);
 }
 
-// --- Global Result State (per-device for multi-GPU) ---
+// --- Global Result State ---
 __device__ int d_found = 0;
 __device__ char d_result[32];
-
-// Host-side flag for multi-GPU synchronization
-static int h_found_flag = 0;
-static volatile sig_atomic_t g_stop_requested = 0;
 
 // --- Checkpoint State ---
 typedef struct {
@@ -439,27 +360,129 @@ typedef struct {
 } CheckpointState;
 
 // --- Real-time Stats ---
-
-// --- Improved Real-time Stats ---
 typedef struct {
-    uint64_t current_hashes;
-    uint64_t total_hashes;
     uint64_t hashes_per_second;
-    uint64_t avg_hashes_per_second;
-    uint64_t peak_hashes_per_second;
-    double progress_percent;
     double eta_seconds;
-    time_t start_time;
+    double progress_percent;
     time_t last_update;
-    uint64_t last_hashes;
-
-    // Moving average for smooth H/s
-    double hps_history[10];
-    int hps_history_idx;
-
-    // Progress bar state
-    int bar_width;
+    uint64_t total_hashes;
 } StatsState;
+
+// --- NVML GPU Monitoring ---
+typedef struct {
+    unsigned int temperature;
+    unsigned int power_draw;
+    unsigned int fan_speed;
+    unsigned int utilization;
+    char name[256];
+} GPUStats;
+
+bool initNVML() {
+    nvmlReturn_t result = nvmlInit();
+    if (result != NVML_SUCCESS) {
+        fprintf(stderr, "[NVML ERROR] Failed to initialize: %s\n", nvmlErrorString(result));
+        return false;
+    }
+    return true;
+}
+
+GPUStats getGPUStats(int device) {
+    nvmlDevice_t nvml_dev;
+    GPUStats stats = {0};
+
+    nvmlReturn_t result = nvmlDeviceGetHandleByIndex(device, &nvml_dev);
+    if (result != NVML_SUCCESS) {
+        return stats;
+    }
+
+    nvmlDeviceGetTemperature(nvml_dev, NVML_TEMPERATURE_GPU, &stats.temperature);
+    nvmlDeviceGetPowerUsage(nvml_dev, &stats.power_draw);
+    nvmlDeviceGetFanSpeed(nvml_dev, &stats.fan_speed);
+    nvmlUtilization_t util;
+    nvmlDeviceGetUtilizationRates(nvml_dev, &util);
+    stats.utilization = util.gpu;
+
+    char name[256];
+    nvmlDeviceGetName(nvml_dev, name, sizeof(name));
+    strcpy(stats.name, name);
+
+    return stats;
+}
+
+void shutdownNVML() {
+    nvmlShutdown();
+}
+
+// --- GPU Auto-Tuning ---
+typedef struct {
+    int compute_major;
+    int compute_minor;
+    int multi_processor_count;
+    int max_threads_per_mp;
+    size_t total_global_mem;
+    char name[256];
+} GPUInfo;
+
+GPUInfo getGPUInfo(int device) {
+    cudaDeviceProp prop;
+    CUDA_CHECK(cudaGetDeviceProperties(&prop, device));
+
+    GPUInfo info = {
+        .compute_major = prop.major,
+        .compute_minor = prop.minor,
+        .multi_processor_count = prop.multiProcessorCount,
+        .max_threads_per_mp = prop.maxThreadsPerMultiProcessor,
+        .total_global_mem = prop.totalGlobalMem
+    };
+    strcpy(info.name, prop.name);
+    return info;
+}
+
+void autoTuneGPU(int device, int* blocks, int* threads) {
+    GPUInfo info = getGPUInfo(device);
+    int compute_cap = info.compute_major * 10 + info.compute_minor;
+
+    // Auto-tune based on architecture
+    switch(compute_cap) {
+        case 52: // Maxwell
+            *blocks = 1024;
+            *threads = 128;
+            break;
+        case 61: // Pascal
+        case 62:
+            *blocks = 2048;
+            *threads = 128;
+            break;
+        case 70: // Volta
+            *blocks = 2048;
+            *threads = 256;
+            break;
+        case 75: // Turing
+            *blocks = 2048;
+            *threads = 256;
+            break;
+        case 80: // Ampere
+        case 86:
+            *blocks = 4096;
+            *threads = 256;
+            break;
+        case 89: // Ada Lovelace
+            *blocks = 4096;
+            *threads = 512;
+            break;
+        case 90: // Hopper
+            *blocks = 8192;
+            *threads = 512;
+            break;
+        default: // Fallback for unknown architectures
+            *blocks = 2048;
+            *threads = 256;
+            break;
+    }
+
+    printf("🔧 Auto-tuned GPU %d (%s): %d blocks, %d threads\n",
+           device, info.name, *blocks, *threads);
+}
 
 void saveCheckpoint(const char* filename, CheckpointState* state) {
     FILE* fp = fopen(filename, "wb");
@@ -468,41 +491,6 @@ void saveCheckpoint(const char* filename, CheckpointState* state) {
         fclose(fp);
         printf("\n💾 Checkpoint saved to %s\n", filename);
     }
-}
-
-void handleSigint(int signo) {
-    (void)signo;
-    g_stop_requested = 1;
-}
-
-void updateCheckpointState(
-    CheckpointState* checkpoint,
-    int hash_choice,
-    int attack_mode,
-    int min_len,
-    int max_len,
-    int current_len,
-    uint64_t offset,
-    uint64_t total_scanned,
-    uint64_t fixed_limit,
-    time_t wall_start,
-    const char* hex_input,
-    const char* salt_input,
-    const char* wordlist_path
-) {
-    checkpoint->hash_choice = hash_choice;
-    checkpoint->attack_mode = attack_mode;
-    checkpoint->min_len = min_len;
-    checkpoint->max_len = max_len;
-    checkpoint->current_len = current_len;
-    checkpoint->offset = offset;
-    checkpoint->total_scanned = total_scanned;
-    checkpoint->fixed_limit = fixed_limit;
-    checkpoint->start_time = wall_start;
-    strcpy(checkpoint->hex_input, hex_input);
-    strcpy(checkpoint->salt_input, salt_input);
-    strcpy(checkpoint->wordlist_path, wordlist_path);
-    checkpoint->salt_len = strlen(salt_input);
 }
 
 int loadCheckpoint(const char* filename, CheckpointState* state) {
@@ -544,6 +532,27 @@ void addToPotfile(const char* potfile_path, const char* hash, const char* passwo
         printf("\n💾 Saved to potfile: %s\n", potfile_path);
     }
 }
+
+// --- Improved Real-time Stats ---
+typedef struct {
+    uint64_t current_hashes;
+    uint64_t total_hashes;
+    uint64_t hashes_per_second;
+    uint64_t avg_hashes_per_second;
+    uint64_t peak_hashes_per_second;
+    double progress_percent;
+    double eta_seconds;
+    time_t start_time;
+    time_t last_update;
+    uint64_t last_hashes;
+
+    // Moving average for smooth H/s
+    double hps_history[10];
+    int hps_history_idx;
+
+    // Progress bar state
+    int bar_width;
+} StatsState;
 
 void initStats(StatsState* stats, uint64_t total_hashes, time_t start_time) {
     memset(stats, 0, sizeof(StatsState));
@@ -727,7 +736,7 @@ void runBenchmark() {
     printf("\n✅ Real benchmark complete!\n");
 }
 
-int parseMaskPattern(const char* pattern, char charsets[10][128], int charset_sizes[10]) {
+int parseMaskPattern(const char* pattern, char charsets[10][128], int charset_sizes[10], const char* custom_charsets[4]) {
     const char* lowercase = "abcdefghijklmnopqrstuvwxyz";
     const char* uppercase = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
     const char* digits = "0123456789";
@@ -763,6 +772,42 @@ int parseMaskPattern(const char* pattern, char charsets[10][128], int charset_si
                     strcpy(charsets[pos], all);
                     charset_sizes[pos] = strlen(all);
                     break;
+                case '1': // custom charset 1
+                    if (custom_charsets[0] != NULL) {
+                        strcpy(charsets[pos], custom_charsets[0]);
+                        charset_sizes[pos] = strlen(custom_charsets[0]);
+                    } else {
+                        strcpy(charsets[pos], all);
+                        charset_sizes[pos] = strlen(all);
+                    }
+                    break;
+                case '2': // custom charset 2
+                    if (custom_charsets[1] != NULL) {
+                        strcpy(charsets[pos], custom_charsets[1]);
+                        charset_sizes[pos] = strlen(custom_charsets[1]);
+                    } else {
+                        strcpy(charsets[pos], all);
+                        charset_sizes[pos] = strlen(all);
+                    }
+                    break;
+                case '3': // custom charset 3
+                    if (custom_charsets[2] != NULL) {
+                        strcpy(charsets[pos], custom_charsets[2]);
+                        charset_sizes[pos] = strlen(custom_charsets[2]);
+                    } else {
+                        strcpy(charsets[pos], all);
+                        charset_sizes[pos] = strlen(all);
+                    }
+                    break;
+                case '4': // custom charset 4
+                    if (custom_charsets[3] != NULL) {
+                        strcpy(charsets[pos], custom_charsets[3]);
+                        charset_sizes[pos] = strlen(custom_charsets[3]);
+                    } else {
+                        strcpy(charsets[pos], all);
+                        charset_sizes[pos] = strlen(all);
+                    }
+                    break;
                 default:
                     strcpy(charsets[pos], all);
                     charset_sizes[pos] = strlen(all);
@@ -788,10 +833,139 @@ __device__ void indexToPassword(uint64_t n, int len, char* out) {
     out[len] = '\0';
 }
 
+// --- Specialized Kernels for Each Hash Type (No Divergence) ---
+__global__ void crackSHA256(uint64_t offset, int len, int iterations) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t start_n = offset + (idx * iterations);
+    char candidate[64];
+    uint8_t hash[32];
+
+    for (int i = 0; i < iterations; i++) {
+        if (d_found) return;
+        indexToPassword(start_n + i, len, candidate);
+        sha256_hash(candidate, len, hash);
+
+        bool match = true;
+        for (int k = 0; k < c_target_bytes; k++) {
+            if (hash[k] != c_target[k]) { match = false; break; }
+        }
+
+        if (match) {
+            if (atomicExch(&d_found, 1) == 0) {
+                for(int k=0; k<=len; k++) d_result[k] = candidate[k];
+            }
+            return;
+        }
+    }
+}
+
+__global__ void crackMD5(uint64_t offset, int len, int iterations) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t start_n = offset + (idx * iterations);
+    char candidate[64];
+    uint8_t hash[32];
+
+    for (int i = 0; i < iterations; i++) {
+        if (d_found) return;
+        indexToPassword(start_n + i, len, candidate);
+        md5_hash(candidate, len, hash);
+
+        bool match = true;
+        for (int k = 0; k < c_target_bytes; k++) {
+            if (hash[k] != c_target[k]) { match = false; break; }
+        }
+
+        if (match) {
+            if (atomicExch(&d_found, 1) == 0) {
+                for(int k=0; k<=len; k++) d_result[k] = candidate[k];
+            }
+            return;
+        }
+    }
+}
+
+__global__ void crackSHA1(uint64_t offset, int len, int iterations) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t start_n = offset + (idx * iterations);
+    char candidate[64];
+    uint8_t hash[32];
+
+    for (int i = 0; i < iterations; i++) {
+        if (d_found) return;
+        indexToPassword(start_n + i, len, candidate);
+        sha1_hash(candidate, len, hash);
+
+        bool match = true;
+        for (int k = 0; k < c_target_bytes; k++) {
+            if (hash[k] != c_target[k]) { match = false; break; }
+        }
+
+        if (match) {
+            if (atomicExch(&d_found, 1) == 0) {
+                for(int k=0; k<=len; k++) d_result[k] = candidate[k];
+            }
+            return;
+        }
+    }
+}
+
+__global__ void crackNTLM(uint64_t offset, int len, int iterations) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t start_n = offset + (idx * iterations);
+    char candidate[64];
+    uint8_t hash[32];
+
+    for (int i = 0; i < iterations; i++) {
+        if (d_found) return;
+        indexToPassword(start_n + i, len, candidate);
+        ntlm_hash(candidate, len, hash);
+
+        bool match = true;
+        for (int k = 0; k < c_target_bytes; k++) {
+            if (hash[k] != c_target[k]) { match = false; break; }
+        }
+
+        if (match) {
+            if (atomicExch(&d_found, 1) == 0) {
+                for(int k=0; k<=len; k++) d_result[k] = candidate[k];
+            }
+            return;
+        }
+    }
+}
+
+__global__ void crackMySQL41(uint64_t offset, int len, int iterations) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t start_n = offset + (idx * iterations);
+    char candidate[64];
+    uint8_t hash[32];
+
+    for (int i = 0; i < iterations; i++) {
+        if (d_found) return;
+        indexToPassword(start_n + i, len, candidate);
+        uint8_t tmp[20];
+        sha1_hash(candidate, len, tmp);
+        sha1_hash((char*)tmp, 20, hash);
+
+        bool match = true;
+        for (int k = 0; k < c_target_bytes; k++) {
+            if (hash[k] != c_target[k]) { match = false; break; }
+        }
+
+        if (match) {
+            if (atomicExch(&d_found, 1) == 0) {
+                for(int k=0; k<=len; k++) d_result[k] = candidate[k];
+            }
+            return;
+        }
+    }
+}
+
+// Generic kernel for salted hashes (keep switch for these less common cases)
 __global__ void crackKernel(uint64_t offset, int len, int iterations, int type) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t start_n = offset + (idx * iterations);
-    char candidate[16];
+    char candidate[64];
     uint8_t hash[32];
 
     for (int i = 0; i < iterations; i++) {
@@ -799,14 +973,10 @@ __global__ void crackKernel(uint64_t offset, int len, int iterations, int type) 
         indexToPassword(start_n + i, len, candidate);
 
         switch(type) {
-            case 1: case 2: sha256_hash(candidate, len, hash); break;
-            case 3: md5_hash(candidate, len, hash); break;
-            case 4: sha1_hash(candidate, len, hash); break;
-            case 5: ntlm_hash(candidate, len, hash); break;
-            case 6: { uint8_t tmp[20]; sha1_hash(candidate, len, tmp); sha1_hash((char*)tmp, 20, hash); } break;
             case 7: md5_salt_pass_hash(candidate, len, hash); break;
             case 8: sha256_salt_pass_hash(candidate, len, hash); break;
             case 9: sha256_pass_salt_hash(candidate, len, hash); break;
+            default: return; // Should not reach here
         }
 
         bool match = true;
@@ -823,9 +993,12 @@ __global__ void crackKernel(uint64_t offset, int len, int iterations, int type) 
     }
 }
 
-__global__ void dictionaryKernel(int type) {
+__global__ void dictionaryKernel(int type, int apply_rules, int rule_count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= d_wordlist_count) return;
+
+    // Coalesced memory access: load 4 bytes at a time using uint32_t*
+    uint32_t* d_wordlist_32 = (uint32_t*)d_wordlist;
 
     // O(1) word access using pre-computed indices
     uint32_t word_start = d_word_indices[idx];
@@ -833,13 +1006,93 @@ __global__ void dictionaryKernel(int type) {
 
     char candidate[64];
     int len = 0;
+
+    // FIXED: Reverted to safe character-by-character read to prevent stack overflow/garbage reads
+    // (The previous "coalesced" attempt was reading out of bounds of the local uint32_t chunk)
     for (uint32_t i = word_start; i < word_end && d_wordlist[i] != '\n' && d_wordlist[i] != '\0'; i++) {
-        candidate[len++] = d_wordlist[i];
+        if (len < 63) candidate[len++] = d_wordlist[i];
     }
     candidate[len] = '\0';
 
     if (len == 0) return;
 
+    // Apply rules if enabled (GPU-side rule processing)
+    if (apply_rules && rule_count > 0) {
+        // Simple rule application: try each rule variant
+        // For production, would need full rule engine in GPU memory
+        char temp_candidate[64];
+        for (int r = 0; r < rule_count && r < 10; r++) {
+            // Copy original word
+            for (int j = 0; j < len; j++) temp_candidate[j] = candidate[j];
+            temp_candidate[len] = '\0';
+            int temp_len = len;
+
+            // Apply rule transformations (simplified for GPU)
+            // Rule 0: lowercase
+            if (r == 0) {
+                for (int j = 0; j < temp_len; j++) {
+                    if (temp_candidate[j] >= 'A' && temp_candidate[j] <= 'Z') {
+                        temp_candidate[j] += 32;
+                    }
+                }
+            }
+            // Rule 1: uppercase
+            else if (r == 1) {
+                for (int j = 0; j < temp_len; j++) {
+                    if (temp_candidate[j] >= 'a' && temp_candidate[j] <= 'z') {
+                        temp_candidate[j] -= 32;
+                    }
+                }
+            }
+            // Rule 2: capitalize first letter
+            else if (r == 2) {
+                if (temp_candidate[0] >= 'a' && temp_candidate[0] <= 'z') {
+                    temp_candidate[0] -= 32;
+                }
+            }
+            // Rule 3: append 's'
+            else if (r == 3 && temp_len < 63) {
+                temp_candidate[temp_len] = 's';
+                temp_candidate[temp_len + 1] = '\0';
+                temp_len++;
+            }
+            // Rule 4: reverse
+            else if (r == 4) {
+                for (int j = 0; j < temp_len / 2; j++) {
+                    char tmp = temp_candidate[j];
+                    temp_candidate[j] = temp_candidate[temp_len - 1 - j];
+                    temp_candidate[temp_len - 1 - j] = tmp;
+                }
+            }
+
+            // Hash the transformed word
+            uint8_t hash[32];
+            switch(type) {
+                case 1: case 2: sha256_hash(temp_candidate, temp_len, hash); break;
+                case 3: md5_hash(temp_candidate, temp_len, hash); break;
+                case 4: sha1_hash(temp_candidate, temp_len, hash); break;
+                case 5: ntlm_hash(temp_candidate, temp_len, hash); break;
+                case 6: { uint8_t tmp[20]; sha1_hash(temp_candidate, temp_len, tmp); sha1_hash((char*)tmp, 20, hash); } break;
+                case 7: md5_salt_pass_hash(temp_candidate, temp_len, hash); break;
+                case 8: sha256_salt_pass_hash(temp_candidate, temp_len, hash); break;
+                case 9: sha256_pass_salt_hash(temp_candidate, temp_len, hash); break;
+            }
+
+            bool match = true;
+            for (int k = 0; k < c_target_bytes; k++) {
+                if (hash[k] != c_target[k]) { match = false; break; }
+            }
+
+            if (match) {
+                if (atomicExch(&d_found, 1) == 0) {
+                    for(int k=0; k<=temp_len; k++) d_result[k] = temp_candidate[k];
+                }
+                return;
+            }
+        }
+    }
+
+    // Hash original word
     uint8_t hash[32];
     switch(type) {
         case 1: case 2: sha256_hash(candidate, len, hash); break;
@@ -902,9 +1155,353 @@ __global__ void maskKernel(uint64_t offset, int type) {
     }
 }
 
-int main() {
-    signal(SIGINT, handleSigint);
+// --- Enhanced Mask Kernel with Iteration Loop ---
+__global__ void maskKernelIter(uint64_t offset, int iterations, int type) {
+    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t start_n = offset + (idx * iterations);
+    char candidate[64];
 
+    for (int i = 0; i < iterations; i++) {
+        if (d_found) return;
+
+        uint64_t temp = start_n + i;
+        for (int pos = c_mask_len - 1; pos >= 0; pos--) {
+            int charset_size = c_mask_charset_sizes[pos];
+            candidate[pos] = c_mask_charsets[pos][temp % charset_size];
+            temp /= charset_size;
+        }
+        candidate[c_mask_len] = '\0';
+
+        uint8_t hash[32];
+        switch(type) {
+            case 1: case 2: sha256_hash(candidate, c_mask_len, hash); break;
+            case 3: md5_hash(candidate, c_mask_len, hash); break;
+            case 4: sha1_hash(candidate, c_mask_len, hash); break;
+            case 5: ntlm_hash(candidate, c_mask_len, hash); break;
+            case 6: { uint8_t tmp[20]; sha1_hash(candidate, c_mask_len, tmp); sha1_hash((char*)tmp, 20, hash); } break;
+            case 7: md5_salt_pass_hash(candidate, c_mask_len, hash); break;
+            case 8: sha256_salt_pass_hash(candidate, c_mask_len, hash); break;
+            case 9: sha256_pass_salt_hash(candidate, c_mask_len, hash); break;
+        }
+
+        bool match = true;
+        for (int k = 0; k < c_target_bytes; k++) {
+            if (hash[k] != c_target[k]) { match = false; break; }
+        }
+
+        if (match) {
+            if (atomicExch(&d_found, 1) == 0) {
+                for(int k=0; k<=c_mask_len; k++) d_result[k] = candidate[k];
+            }
+            return;
+        }
+    }
+}
+
+// --- Hybrid Attack Kernel (Dictionary + Mask) ---
+__global__ void hybridKernel(int word_idx, uint64_t mask_offset, int mask_iterations, int type) {
+    if (word_idx >= d_wordlist_count) return;
+
+    // Get dictionary word
+    uint32_t word_start = d_word_indices[word_idx];
+    uint32_t word_end = (word_idx < d_wordlist_count - 1) ? d_word_indices[word_idx + 1] : d_wordlist_size;
+
+    char dict_word[64];
+    int dict_len = 0;
+    for (uint32_t i = word_start; i < word_end && d_wordlist[i] != '\n' && d_wordlist[i] != '\0'; i++) {
+        dict_word[dict_len++] = d_wordlist[i];
+    }
+    dict_word[dict_len] = '\0';
+
+    if (dict_len == 0) return;
+
+    // Generate mask combinations and append to dictionary word
+    uint64_t idx = blockIdx.x * blockDim.x + threadIdx.x;
+    uint64_t start_n = mask_offset + (idx * mask_iterations);
+
+    for (int i = 0; i < mask_iterations; i++) {
+        if (d_found) return;
+
+        char candidate[128];
+        uint64_t temp = start_n + i;
+
+        // Copy dictionary word first
+        for (int j = 0; j < dict_len; j++) {
+            candidate[j] = dict_word[j];
+        }
+
+        // Append mask pattern
+        for (int pos = c_mask_len - 1; pos >= 0; pos--) {
+            int charset_size = c_mask_charset_sizes[pos];
+            candidate[dict_len + pos] = c_mask_charsets[pos][temp % charset_size];
+            temp /= charset_size;
+        }
+        candidate[dict_len + c_mask_len] = '\0';
+
+        uint8_t hash[32];
+        int total_len = dict_len + c_mask_len;
+        switch(type) {
+            case 1: case 2: sha256_hash(candidate, total_len, hash); break;
+            case 3: md5_hash(candidate, total_len, hash); break;
+            case 4: sha1_hash(candidate, total_len, hash); break;
+            case 5: ntlm_hash(candidate, total_len, hash); break;
+            case 6: { uint8_t tmp[20]; sha1_hash(candidate, total_len, tmp); sha1_hash((char*)tmp, 20, hash); } break;
+            case 7: md5_salt_pass_hash(candidate, total_len, hash); break;
+            case 8: sha256_salt_pass_hash(candidate, total_len, hash); break;
+            case 9: sha256_pass_salt_hash(candidate, total_len, hash); break;
+        }
+
+        bool match = true;
+        for (int k = 0; k < c_target_bytes; k++) {
+            if (hash[k] != c_target[k]) { match = false; break; }
+        }
+
+        if (match) {
+            if (atomicExch(&d_found, 1) == 0) {
+                for(int k=0; k<=total_len; k++) d_result[k] = candidate[k];
+            }
+            return;
+        }
+    }
+}
+
+// --- Rule Engine (Hashcat-Compatible) ---
+#define MAX_RULES 1000
+#define MAX_WORD_LENGTH 128
+#define MAX_RULE_LINE 256
+
+typedef struct {
+    char rule[16];
+    int param;
+} Rule;
+
+Rule rules[MAX_RULES];
+int rule_count = 0;
+
+void applyRule(char* word, const Rule* rule) {
+    int len = strlen(word);
+    if (len == 0) return;
+
+    switch(rule->rule[0]) {
+        case ':': // No op
+            break;
+        case 'l': // Lowercase all
+            for (int i = 0; i < len; i++) {
+                if (word[i] >= 'A' && word[i] <= 'Z') {
+                    word[i] += 32;
+                }
+            }
+            break;
+        case 'u': // Uppercase all
+            for (int i = 0; i < len; i++) {
+                if (word[i] >= 'a' && word[i] <= 'z') {
+                    word[i] -= 32;
+                }
+            }
+            break;
+        case 'c': // Capitalize first letter
+            if (word[0] >= 'a' && word[0] <= 'z') {
+                word[0] -= 32;
+            }
+            break;
+        case 'C': // Lowercase first, uppercase rest
+            if (word[0] >= 'A' && word[0] <= 'Z') {
+                word[0] += 32;
+            }
+            for (int i = 1; i < len; i++) {
+                if (word[i] >= 'a' && word[i] <= 'z') {
+                    word[i] -= 32;
+                }
+            }
+            break;
+        case 't': // Toggle case
+            for (int i = 0; i < len; i++) {
+                if (word[i] >= 'a' && word[i] <= 'z') {
+                    word[i] -= 32;
+                } else if (word[i] >= 'A' && word[i] <= 'Z') {
+                    word[i] += 32;
+                }
+            }
+            break;
+        case 'r': // Reverse word
+            for (int i = 0; i < len / 2; i++) {
+                char temp = word[i];
+                word[i] = word[len - 1 - i];
+                word[len - 1 - i] = temp;
+            }
+            break;
+        case 'd': // Duplicate word
+            if (len * 2 < MAX_WORD_LENGTH - 1) {
+                memmove(word + len, word, len);
+                word[len * 2] = '\0';
+            }
+            break;
+        case 'p': // Pluralize (add 's')
+            if (len < MAX_WORD_LENGTH - 1) {
+                word[len] = 's';
+                word[len + 1] = '\0';
+            }
+            break;
+        case '$': // Append character
+            if (len < MAX_WORD_LENGTH - 1) {
+                word[len] = (char)rule->param;
+                word[len + 1] = '\0';
+            }
+            break;
+        case '^': // Prepend character
+            if (len < MAX_WORD_LENGTH - 1) {
+                memmove(word + 1, word, len + 1);
+                word[0] = (char)rule->param;
+            }
+            break;
+        case '@': // Remove all occurrences
+            {
+                char target = (char)rule->param;
+                int j = 0;
+                for (int i = 0; word[i]; i++) {
+                    if (word[i] != target) {
+                        word[j++] = word[i];
+                    }
+                }
+                word[j] = '\0';
+            }
+            break;
+        case '!': // Reject if contains
+            {
+                char target = (char)rule->param;
+                for (int i = 0; word[i]; i++) {
+                    if (word[i] == target) {
+                        word[0] = '\0'; // Mark as rejected
+                        return;
+                    }
+                }
+            }
+            break;
+        case '+': // Increment char at position
+            {
+                int pos = rule->param;
+                if (pos >= 0 && pos < len) {
+                    if (word[pos] >= 'a' && word[pos] <= 'z') {
+                        word[pos]++;
+                        if (word[pos] > 'z') word[pos] = 'a';
+                    } else if (word[pos] >= 'A' && word[pos] <= 'Z') {
+                        word[pos]++;
+                        if (word[pos] > 'Z') word[pos] = 'A';
+                    } else if (word[pos] >= '0' && word[pos] <= '9') {
+                        word[pos]++;
+                        if (word[pos] > '9') word[pos] = '0';
+                    }
+                }
+            }
+            break;
+        case '-': // Decrement char at position
+            {
+                int pos = rule->param;
+                if (pos >= 0 && pos < len) {
+                    if (word[pos] >= 'a' && word[pos] <= 'z') {
+                        word[pos]--;
+                        if (word[pos] < 'a') word[pos] = 'z';
+                    } else if (word[pos] >= 'A' && word[pos] <= 'Z') {
+                        word[pos]--;
+                        if (word[pos] < 'A') word[pos] = 'Z';
+                    } else if (word[pos] >= '0' && word[pos] <= '9') {
+                        word[pos]--;
+                        if (word[pos] < '0') word[pos] = '9';
+                    }
+                }
+            }
+            break;
+    }
+}
+
+void estimateHashRate() {
+    printf("\n========================================\n");
+    printf("   📈 HASH RATE ESTIMATOR\n");
+    printf("========================================\n\n");
+    
+    int device_count;
+    cudaGetDeviceCount(&device_count);
+    
+    printf("Detected %d GPU(s). Running quick tests...\n\n", device_count);
+    
+    // Quick test logic (similar to benchmark but shorter)
+    int threads = 256, blocks = 2048, iterations = 5000;
+    uint64_t batch_size = (uint64_t)blocks * threads * iterations;
+    
+    for (int type = 1; type <= 5; type++) {
+        clock_t start = clock();
+        crackKernel<<<blocks, threads>>>(0, 6, iterations, type);
+        cudaDeviceSynchronize();
+        clock_t end = clock();
+        
+        double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
+        double hps = batch_size / elapsed;
+        
+        char hps_str[32];
+        formatNumber((uint64_t)hps, hps_str, sizeof(hps_str));
+        printf("Type %d Estimated Speed: %sH/s\n", type, hps_str);
+    }
+    printf("\n✅ Estimation complete!\n");
+}
+
+int loadRules(const char* rule_file) {
+    FILE* fp = fopen(rule_file, "r");
+    if (!fp) return 0;
+
+    char line[MAX_RULE_LINE];
+    rule_count = 0;
+
+    while (fgets(line, sizeof(line), fp) && rule_count < MAX_RULES) {
+        // Skip comments and empty lines
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
+
+        // Parse rule
+        int len = strlen(line);
+        int i = 0;
+
+        while (i < len && rule_count < MAX_RULES) {
+            // Skip whitespace
+            while (i < len && (line[i] == ' ' || line[i] == '\t' || line[i] == '\n' || line[i] == '\r')) i++;
+            if (i >= len) break;
+
+            rules[rule_count].rule[0] = line[i];
+            rules[rule_count].rule[1] = '\0';
+
+            // Check if rule has parameter
+            if (i + 1 < len && (line[i+1] >= '0' && line[i+1] <= '9')) {
+                rules[rule_count].param = line[i+1] - '0';
+                i += 2;
+            } else if (i + 1 < len && line[i+1] != ' ' && line[i+1] != '\t') {
+                rules[rule_count].param = line[i+1];
+                i += 2;
+            } else {
+                rules[rule_count].param = 0;
+                i++;
+            }
+
+            rule_count++;
+        }
+    }
+
+    fclose(fp);
+    return rule_count;
+}
+
+// --- Signal Handler for Graceful Shutdown ---
+static volatile int keep_running = 1;
+static CheckpointState* g_checkpoint = NULL;
+static const char* g_checkpoint_path = "nexo_checkpoint.bin";
+
+void signal_handler(int sig) {
+    printf("\n\n⚠️  Interrupted! Saving checkpoint...\n");
+    if (g_checkpoint != NULL) {
+        saveCheckpoint(g_checkpoint_path, g_checkpoint);
+        printf("✅ Checkpoint saved. Resume with mode 4.\n");
+    }
+    exit(0);
+}
+
+int main() {
     char hex_input[128];
     char wordlist_path[256];
     char salt_input[64];
@@ -915,7 +1512,13 @@ int main() {
 
     printf("\n========================================\n");
     printf("   🚀 NEXO MASTER GPU CRACKER v4.0\n");
+    printf("   👤 CREATED BY: RAMJI\n");
     printf("========================================\n");
+
+    // Register signal handlers
+    signal(SIGINT, signal_handler);
+    signal(SIGTERM, signal_handler);
+    g_checkpoint = &checkpoint;
 
     printf("\n[0] Select Mode:\n");
     printf("    1. Crack Hash      2. Benchmark\n");
@@ -980,7 +1583,7 @@ int main() {
 
     printf("\n[4] Select Attack Mode:\n");
     printf("    1. Brute-Force      2. Dictionary Attack\n");
-    printf("    3. Mask Attack\n");
+    printf("    3. Mask Attack      4. Hybrid Attack (Dictionary + Mask)\n");
     printf("    Choice: "); scanf("%d", &attack_mode);
 
     uint8_t h_target[32] = {0};
@@ -1002,9 +1605,21 @@ int main() {
         char mask_pattern[64];
         printf("\n[5] Enter Mask Pattern (e.g., ?l?l?l?d?d): "); scanf("%s", mask_pattern);
 
+        // Custom charsets for ?1, ?2, ?3, ?4
+        const char* custom_charsets[4] = {NULL, NULL, NULL, NULL};
+        printf("\n[5a] Enter Custom Charsets (optional, press Enter to skip):\n");
+        printf("    ?1 charset: "); char cs1[128]; scanf(" %127[^\n]", cs1);
+        if (strlen(cs1) > 0) custom_charsets[0] = cs1;
+        printf("    ?2 charset: "); char cs2[128]; scanf(" %127[^\n]", cs2);
+        if (strlen(cs2) > 0) custom_charsets[1] = cs2;
+        printf("    ?3 charset: "); char cs3[128]; scanf(" %127[^\n]", cs3);
+        if (strlen(cs3) > 0) custom_charsets[2] = cs3;
+        printf("    ?4 charset: "); char cs4[128]; scanf(" %127[^\n]", cs4);
+        if (strlen(cs4) > 0) custom_charsets[3] = cs4;
+
         char h_charsets[10][128];
         int h_charset_sizes[10];
-        int mask_len = parseMaskPattern(mask_pattern, h_charsets, h_charset_sizes);
+        int mask_len = parseMaskPattern(mask_pattern, h_charsets, h_charset_sizes, custom_charsets);
 
         cudaMemcpyToSymbol(c_mask_pattern, mask_pattern, strlen(mask_pattern) + 1);
         cudaMemcpyToSymbol(c_mask_len, &mask_len, sizeof(int));
@@ -1023,33 +1638,56 @@ int main() {
         printf("\n🎭 Mask: %s\n", mask_pattern);
         printf("📊 Total combinations: %.2e\n", (double)total_combinations);
 
-        int threads = 256;
-        int blocks = 2048;
-        uint64_t batch_size = threads * blocks;
+        // Auto-tune GPU
+        int threads = 256, blocks = 2048;
+        autoTuneGPU(0, &blocks, &threads);
+
+        int mask_iterations = 1000;
+        uint64_t batch_size = (uint64_t)blocks * threads * mask_iterations;
         uint64_t offset = 0;
         time_t mask_start = time(NULL);
         StatsState mask_stats;
         initStats(&mask_stats, total_combinations, mask_start);
 
+        // Initialize NVML
+        bool nvml_available = initNVML();
+
         while (offset < total_combinations) {
-            maskKernel<<<blocks, threads>>>(offset, hash_choice);
-            cudaDeviceSynchronize();
-            cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int));
+            uint64_t remaining = total_combinations - offset;
+            uint64_t current_iterations = (remaining < batch_size) ?
+                                          (remaining / (blocks * threads)) : mask_iterations;
+            if (current_iterations == 0) current_iterations = 1;
+
+            maskKernelIter<<<blocks, threads>>>(offset, current_iterations, hash_choice);
+            KERNEL_CHECK();
+            CUDA_CHECK(cudaDeviceSynchronize());
+            CUDA_CHECK(cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int)));
 
             updateStats(&mask_stats, offset);
+
+            // Get GPU stats if NVML available
+            if (nvml_available && offset % (batch_size * 10) == 0) {
+                GPUStats gpu_stats = getGPUStats(0);
+                printf("\r🌡️ %d°C | ⚡ %uW | 🌀 %u%%  ",
+                       gpu_stats.temperature, gpu_stats.power_draw / 1000, gpu_stats.utilization);
+                fflush(stdout);
+            }
+
             if (offset % (batch_size * 10) == 0) displayStats(&mask_stats);
 
             if (h_found) {
                 char res[64];
-                cudaMemcpyFromSymbol(res, d_result, 64);
+                CUDA_CHECK(cudaMemcpyFromSymbol(res, d_result, 64));
                 printf("\n\n🎉 FOUND! Password: %s\n", res);
                 addToPotfile("nexo.potfile", hex_input, res);
+                if (nvml_available) shutdownNVML();
                 return 0;
             }
 
             offset += batch_size;
         }
         printf("\n❌ Password not found in mask space.\n");
+        if (nvml_available) shutdownNVML();
         return 0;
     }
 
@@ -1065,78 +1703,329 @@ int main() {
         struct stat st;
         stat(wordlist_path, &st);
         long file_size = st.st_size;
+        const size_t CHUNK_SIZE = 50 * 1024 * 1024; // 50MB chunks
+        size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+        size_t chunk_words_processed = 0;
 
-        // Load entire wordlist (no 1MB limit now)
-        char* wordlist_buffer = (char*)malloc(file_size + 1);
-        fread(wordlist_buffer, 1, file_size, fp);
-        wordlist_buffer[file_size] = '\0';
-        fclose(fp);
+        printf("\n📚 Wordlist size: %.2f MB (%zu chunks)\n", (double)file_size / (1024 * 1024), total_chunks);
+        printf("🔍 Starting Chunked Dictionary Attack...\n");
 
-        // Pre-compute word indices on CPU
-        int word_count = 0;
-        for (int i = 0; i < file_size; i++) {
-            if (wordlist_buffer[i] == '\n') word_count++;
-        }
+        // Auto-tune GPU
+        int threads = 256, blocks = 2048;
+        autoTuneGPU(0, &blocks, &threads);
 
-        uint32_t* word_indices = (uint32_t*)malloc((word_count + 1) * sizeof(uint32_t));
-        int current_word = 0;
-        word_indices[0] = 0;
-        for (int i = 0; i < file_size && current_word < word_count; i++) {
-            if (wordlist_buffer[i] == '\n') {
-                word_indices[++current_word] = i + 1;
+        time_t dict_start = time(NULL);
+        StatsState dict_stats;
+        initStats(&dict_stats, file_size, dict_start);
+
+        // Initialize NVML
+        bool nvml_available = initNVML();
+
+        // Create CUDA stream for async operations
+        cudaStream_t dict_stream;
+        CUDA_CHECK(cudaStreamCreate(&dict_stream));
+
+        // Process wordlist in chunks with async memory transfers
+        for (size_t chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
+            size_t chunk_offset = chunk_idx * CHUNK_SIZE;
+            size_t chunk_bytes = (chunk_idx == total_chunks - 1) ?
+                               (file_size - chunk_offset) : CHUNK_SIZE;
+
+            // Allocate chunk buffer
+            char* chunk_buffer = (char*)malloc(chunk_bytes + 1);
+            if (!chunk_buffer) {
+                printf("\n❌ Error: Memory allocation failed for chunk\n");
+                fclose(fp);
+                if (nvml_available) shutdownNVML();
+                cudaStreamDestroy(dict_stream);
+                return 1;
+            }
+
+            // Read chunk
+            fseek(fp, chunk_offset, SEEK_SET);
+            size_t bytes_read = fread(chunk_buffer, 1, chunk_bytes, fp);
+            chunk_buffer[bytes_read] = '\0';
+
+            // Count words in chunk
+            int chunk_word_count = 0;
+            for (size_t i = 0; i < bytes_read; i++) {
+                if (chunk_buffer[i] == '\n') chunk_word_count++;
+            }
+
+            if (chunk_word_count == 0) {
+                free(chunk_buffer);
+                continue;
+            }
+
+            // Pre-compute word indices for chunk
+            uint32_t* chunk_word_indices = (uint32_t*)malloc((chunk_word_count + 1) * sizeof(uint32_t));
+            int current_word = 0;
+            chunk_word_indices[0] = 0;
+            for (size_t i = 0; i < bytes_read && current_word < chunk_word_count; i++) {
+                if (chunk_buffer[i] == '\n') {
+                    chunk_word_indices[++current_word] = i + 1;
+                }
+            }
+
+            // Allocate GPU memory for this chunk
+            char* d_chunk_ptr;
+            uint32_t* d_chunk_indices_ptr;
+            CUDA_CHECK(cudaMalloc(&d_chunk_ptr, chunk_bytes + 1));
+            CUDA_CHECK(cudaMalloc(&d_chunk_indices_ptr, (chunk_word_count + 1) * sizeof(uint32_t)));
+
+            // Async copy chunk to GPU (overlaps with previous kernel execution)
+            CUDA_CHECK(cudaMemcpyAsync(d_chunk_ptr, chunk_buffer, chunk_bytes + 1, cudaMemcpyHostToDevice, dict_stream));
+            CUDA_CHECK(cudaMemcpyAsync(d_chunk_indices_ptr, chunk_word_indices, (chunk_word_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice, dict_stream));
+
+            // Synchronize to ensure data is ready
+            CUDA_CHECK(cudaStreamSynchronize(dict_stream));
+
+            // Set device pointers
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist, &d_chunk_ptr, sizeof(char*)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_word_indices, &d_chunk_indices_ptr, sizeof(uint32_t*)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_size, (int*)&chunk_bytes, sizeof(int)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_count, &chunk_word_count, sizeof(int)));
+
+            // Launch kernel for this chunk (no rules by default, can be enabled via command line)
+            int blocks = (chunk_word_count + threads - 1) / threads;
+            dictionaryKernel<<<blocks, threads, 0, dict_stream>>>(hash_choice, 0, 0); // apply_rules=0, rule_count=0
+            KERNEL_CHECK();
+            CUDA_CHECK(cudaStreamSynchronize(dict_stream));
+
+            // Check if found
+            CUDA_CHECK(cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int)));
+
+            // Cleanup GPU memory for this chunk
+            CUDA_CHECK(cudaFree(d_chunk_ptr));
+            CUDA_CHECK(cudaFree(d_chunk_indices_ptr));
+
+            free(chunk_buffer);
+            free(chunk_word_indices);
+
+            // Update progress
+            chunk_words_processed += chunk_word_count;
+            updateStats(&dict_stats, chunk_offset + bytes_read);
+
+            // Get GPU stats if NVML available
+            if (nvml_available && chunk_idx % 10 == 0) {
+                GPUStats gpu_stats = getGPUStats(0);
+                printf("\r🌡️ %d°C | ⚡ %uW | 🌀 %u%%  ",
+                       gpu_stats.temperature, gpu_stats.power_draw / 1000, gpu_stats.utilization);
+                fflush(stdout);
+            }
+
+            if (chunk_idx % 10 == 0 || chunk_idx == total_chunks - 1) {
+                displayStats(&dict_stats);
+            }
+
+            if (h_found) {
+                char res[64];
+                CUDA_CHECK(cudaMemcpyFromSymbol(res, d_result, 64));
+                printf("\n🎉 FOUND! Password: %s\n", res);
+                addToPotfile("nexo.potfile", hex_input, res);
+                fclose(fp);
+                if (nvml_available) shutdownNVML();
+                return 0;
             }
         }
 
-        // Allocate GPU memory
-        char* d_wordlist_ptr;
-        uint32_t* d_word_indices_ptr;
-        cudaMalloc(&d_wordlist_ptr, file_size + 1);
-        cudaMalloc(&d_word_indices_ptr, (word_count + 1) * sizeof(uint32_t));
+        fclose(fp);
+        cudaStreamDestroy(dict_stream);
+        printf("\n❌ Password not found in wordlist.\n");
+        if (nvml_available) shutdownNVML();
+        return 0;
+    }
 
-        // Copy to GPU
-        cudaMemcpy(d_wordlist_ptr, wordlist_buffer, file_size + 1, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_word_indices_ptr, word_indices, (word_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
+    if (attack_mode == 4) {
+        // Hybrid Attack (Dictionary + Mask)
+        printf("\n[6] Enter Wordlist Path: "); scanf("%s", wordlist_path);
 
-        // Set device pointers
-        cudaMemcpyToSymbol(d_wordlist, &d_wordlist_ptr, sizeof(char*));
-        cudaMemcpyToSymbol(d_word_indices, &d_word_indices_ptr, sizeof(uint32_t*));
-        cudaMemcpyToSymbol(d_wordlist_size, &file_size, sizeof(int));
-        cudaMemcpyToSymbol(d_wordlist_count, &word_count, sizeof(int));
-
-        free(wordlist_buffer);
-        free(word_indices);
-
-        printf("\n📚 Loaded %d words from wordlist (%.2f MB)\n", word_count, (double)file_size / (1024 * 1024));
-        printf("🔍 Starting Dictionary Attack...\n");
-
-        int threads = 256;
-        int blocks = (word_count + threads - 1) / threads;
-        time_t dict_start = time(NULL);
-        StatsState dict_stats;
-        initStats(&dict_stats, word_count, dict_start);
-
-        dictionaryKernel<<<blocks, threads>>>(hash_choice);
-        cudaDeviceSynchronize();
-
-        updateStats(&dict_stats, word_count);
-        displayStats(&dict_stats);
-
-        cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int));
-
-        // Cleanup GPU memory
-        cudaFree(d_wordlist_ptr);
-        cudaFree(d_word_indices_ptr);
-
-        if (h_found) {
-            char res[64];
-            cudaMemcpyFromSymbol(res, d_result, 64);
-            printf("\n🎉 FOUND! Password: %s\n", res);
-            addToPotfile("nexo.potfile", hex_input, res);
-            return 0;
-        } else {
-            printf("\n❌ Password not found in wordlist.\n");
-            return 0;
+        FILE* fp = fopen(wordlist_path, "r");
+        if (!fp) {
+            printf("\n❌ Error: Cannot open wordlist file: %s\n", wordlist_path);
+            return 1;
         }
+
+        char mask_pattern[64];
+        printf("\n[7] Enter Mask Pattern (e.g., ?d?d): "); scanf("%s", mask_pattern);
+
+        // Custom charsets for ?1, ?2, ?3, ?4
+        const char* custom_charsets[4] = {NULL, NULL, NULL, NULL};
+        printf("\n[7a] Enter Custom Charsets (optional, press Enter to skip):\n");
+        printf("    ?1 charset: "); char cs1[128]; scanf(" %127[^\n]", cs1);
+        if (strlen(cs1) > 0) custom_charsets[0] = cs1;
+        printf("    ?2 charset: "); char cs2[128]; scanf(" %127[^\n]", cs2);
+        if (strlen(cs2) > 0) custom_charsets[1] = cs2;
+        printf("    ?3 charset: "); char cs3[128]; scanf(" %127[^\n]", cs3);
+        if (strlen(cs3) > 0) custom_charsets[2] = cs3;
+        printf("    ?4 charset: "); char cs4[128]; scanf(" %127[^\n]", cs4);
+        if (strlen(cs4) > 0) custom_charsets[3] = cs4;
+
+        char h_charsets[10][128];
+        int h_charset_sizes[10];
+        int mask_len = parseMaskPattern(mask_pattern, h_charsets, h_charset_sizes, custom_charsets);
+
+        cudaMemcpyToSymbol(c_mask_pattern, mask_pattern, strlen(mask_pattern) + 1);
+        cudaMemcpyToSymbol(c_mask_len, &mask_len, sizeof(int));
+
+        for (int i = 0; i < mask_len; i++) {
+            cudaMemcpyToSymbol(c_mask_charsets[i], h_charsets[i], 128);
+            cudaMemcpyToSymbol(&c_mask_charset_sizes[i], &h_charset_sizes[i], sizeof(int));
+        }
+
+        // Calculate total mask combinations
+        uint64_t mask_combinations = 1;
+        for (int i = 0; i < mask_len; i++) {
+            mask_combinations *= h_charset_sizes[i];
+        }
+
+        printf("\n🎭 Mask: %s\n", mask_pattern);
+        printf("📊 Mask combinations: %.2e\n", (double)mask_combinations);
+
+        // Get file size for stats
+        struct stat st;
+        stat(wordlist_path, &st);
+        long file_size = st.st_size;
+
+        // Auto-tune GPU
+        int threads = 256, blocks = 2048;
+        autoTuneGPU(0, &blocks, &threads);
+
+        int mask_iterations = 1000;
+        uint64_t mask_batch_size = (uint64_t)blocks * threads * mask_iterations;
+        const size_t CHUNK_SIZE = 50 * 1024 * 1024; // 50MB chunks
+        size_t total_chunks = (file_size + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+        printf("\n📚 Wordlist size: %.2f MB (%zu chunks)\n", (double)file_size / (1024 * 1024), total_chunks);
+        printf("🔍 Starting Hybrid Attack (Dictionary + Mask)...\n");
+
+        time_t hybrid_start = time(NULL);
+        StatsState hybrid_stats;
+        initStats(&hybrid_stats, file_size, hybrid_start);
+
+        // Initialize NVML
+        bool nvml_available = initNVML();
+
+        // Process wordlist in chunks
+        for (size_t chunk_idx = 0; chunk_idx < total_chunks; chunk_idx++) {
+            size_t chunk_offset = chunk_idx * CHUNK_SIZE;
+            size_t chunk_bytes = (chunk_idx == total_chunks - 1) ?
+                               (file_size - chunk_offset) : CHUNK_SIZE;
+
+            // Allocate chunk buffer
+            char* chunk_buffer = (char*)malloc(chunk_bytes + 1);
+            if (!chunk_buffer) {
+                printf("\n❌ Error: Memory allocation failed for chunk\n");
+                fclose(fp);
+                if (nvml_available) shutdownNVML();
+                return 1;
+            }
+
+            // Read chunk
+            fseek(fp, chunk_offset, SEEK_SET);
+            size_t bytes_read = fread(chunk_buffer, 1, chunk_bytes, fp);
+            chunk_buffer[bytes_read] = '\0';
+
+            // Count words in chunk
+            int chunk_word_count = 0;
+            for (size_t i = 0; i < bytes_read; i++) {
+                if (chunk_buffer[i] == '\n') chunk_word_count++;
+            }
+
+            if (chunk_word_count == 0) {
+                free(chunk_buffer);
+                continue;
+            }
+
+            // Pre-compute word indices for chunk
+            uint32_t* chunk_word_indices = (uint32_t*)malloc((chunk_word_count + 1) * sizeof(uint32_t));
+            int current_word = 0;
+            chunk_word_indices[0] = 0;
+            for (size_t i = 0; i < bytes_read && current_word < chunk_word_count; i++) {
+                if (chunk_buffer[i] == '\n') {
+                    chunk_word_indices[++current_word] = i + 1;
+                }
+            }
+
+            // Allocate GPU memory for this chunk
+            char* d_chunk_ptr;
+            uint32_t* d_chunk_indices_ptr;
+            CUDA_CHECK(cudaMalloc(&d_chunk_ptr, chunk_bytes + 1));
+            CUDA_CHECK(cudaMalloc(&d_chunk_indices_ptr, (chunk_word_count + 1) * sizeof(uint32_t)));
+
+            // Copy chunk to GPU
+            CUDA_CHECK(cudaMemcpy(d_chunk_ptr, chunk_buffer, chunk_bytes + 1, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_chunk_indices_ptr, chunk_word_indices, (chunk_word_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+
+            // Set device pointers
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist, &d_chunk_ptr, sizeof(char*)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_word_indices, &d_chunk_indices_ptr, sizeof(uint32_t*)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_size, (int*)&chunk_bytes, sizeof(int)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_count, &chunk_word_count, sizeof(int)));
+
+            // Process each word with mask combinations
+            for (int word_idx = 0; word_idx < chunk_word_count; word_idx++) {
+                if (h_found) break;
+
+                uint64_t mask_offset = 0;
+                while (mask_offset < mask_combinations) {
+                    uint64_t remaining_mask = mask_combinations - mask_offset;
+                    uint64_t current_mask_iterations = (remaining_mask < mask_batch_size) ?
+                                                       (remaining_mask / (blocks * threads)) : mask_iterations;
+                    if (current_mask_iterations == 0) current_mask_iterations = 1;
+
+                    hybridKernel<<<blocks, threads>>>(word_idx, mask_offset, current_mask_iterations, hash_choice);
+                    KERNEL_CHECK();
+                    CUDA_CHECK(cudaDeviceSynchronize());
+                    CUDA_CHECK(cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int)));
+
+                    if (h_found) {
+                        char res[128];
+                        CUDA_CHECK(cudaMemcpyFromSymbol(res, d_result, 128));
+                        printf("\n🎉 FOUND! Password: %s\n", res);
+                        addToPotfile("nexo.potfile", hex_input, res);
+
+                        // Cleanup
+                        CUDA_CHECK(cudaFree(d_chunk_ptr));
+                        CUDA_CHECK(cudaFree(d_chunk_indices_ptr));
+                        free(chunk_buffer);
+                        free(chunk_word_indices);
+                        fclose(fp);
+                        if (nvml_available) shutdownNVML();
+                        return 0;
+                    }
+
+                    mask_offset += mask_batch_size;
+                }
+            }
+
+            // Cleanup GPU memory for this chunk
+            CUDA_CHECK(cudaFree(d_chunk_ptr));
+            CUDA_CHECK(cudaFree(d_chunk_indices_ptr));
+
+            free(chunk_buffer);
+            free(chunk_word_indices);
+
+            // Update progress
+            updateStats(&hybrid_stats, chunk_offset + bytes_read);
+
+            // Get GPU stats if NVML available
+            if (nvml_available && chunk_idx % 5 == 0) {
+                GPUStats gpu_stats = getGPUStats(0);
+                printf("\r🌡️ %d°C | ⚡ %uW | 🌀 %u%%  ",
+                       gpu_stats.temperature, gpu_stats.power_draw / 1000, gpu_stats.utilization);
+                fflush(stdout);
+            }
+
+            if (chunk_idx % 5 == 0 || chunk_idx == total_chunks - 1) {
+                displayStats(&hybrid_stats);
+            }
+        }
+
+        fclose(fp);
+        printf("\n❌ Password not found in hybrid attack.\n");
+        if (nvml_available) shutdownNVML();
+        return 0;
     } else {
         printf("\n[6] Enter Length Range (min max): "); scanf("%d %d", &min_len, &max_len);
         printf("\n[7] Select Run Mode (1: 12h, 2: Fixed B): "); scanf("%d", &limit_choice);
@@ -1144,25 +2033,43 @@ int main() {
 
         const char* h_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*";
         int h_charset_len = strlen(h_charset);
-        CUDA_CHECK(cudaMemcpyToSymbol(c_charset, h_charset, h_charset_len + 1));
-        CUDA_CHECK(cudaMemcpyToSymbol(c_charset_len, &h_charset_len, sizeof(int)));
+        cudaMemcpyToSymbol(c_charset, h_charset, h_charset_len + 1);
+        cudaMemcpyToSymbol(c_charset_len, &h_charset_len, sizeof(int));
 
+        // Auto-tune GPU for each device
         int threads = 256, blocks = 2048, iterations = 5000;
-        uint64_t batch_size = (uint64_t)blocks * threads * iterations;
-        time_t wall_start = time(NULL); uint64_t total_scanned = 0;
-        time_t last_checkpoint = time(NULL);
-
-        // Multi-GPU Support
         int device_count;
-        CUDA_CHECK(cudaGetDeviceCount(&device_count));
-        if (device_count < 1) {
-            fprintf(stderr, "\n❌ No CUDA-capable GPU found.\n");
-            return 1;
-        }
+        cudaGetDeviceCount(&device_count);
         printf("\n🖥️  Detected %d GPU(s)\n", device_count);
 
         if (device_count > 1) {
             printf("⚡ Using Multi-GPU mode with load balancing\n");
+        }
+
+        // Auto-tune each GPU
+        for (int dev = 0; dev < device_count; dev++) {
+            autoTuneGPU(dev, &blocks, &threads);
+        }
+
+        uint64_t batch_size = (uint64_t)blocks * threads * iterations;
+        time_t wall_start = time(NULL); uint64_t total_scanned = 0;
+        time_t last_checkpoint = time(NULL);
+        uint64_t total_to_scan = 0;
+        for (int l = min_len; l <= max_len; l++) {
+            uint64_t comb = 1; for(int i=0; i<l; i++) comb *= h_charset_len;
+            total_to_scan += comb;
+        }
+        StatsState stats;
+        initStats(&stats, total_to_scan, wall_start);
+
+        // Initialize NVML
+        bool nvml_available = initNVML();
+
+        // Create CUDA streams for each GPU (asynchronous multi-GPU)
+        cudaStream_t* streams = (cudaStream_t*)malloc(device_count * sizeof(cudaStream_t));
+        for (int dev = 0; dev < device_count; dev++) {
+            cudaSetDevice(dev);
+            CUDA_CHECK(cudaStreamCreate(&streams[dev]));
         }
 
         int start_len = is_resume ? checkpoint.current_len : min_len;
@@ -1175,79 +2082,122 @@ int main() {
             uint64_t offset = (len == start_len) ? start_offset : 0;
             total_scanned = (len == start_len) ? start_total : total_scanned;
 
-            StatsState stats;
-            initStats(&stats, max_idx, wall_start);
-
             while (offset < max_idx) {
-                if (g_stop_requested) {
-                    printf("\n\n🛑 SIGINT received. Saving checkpoint and exiting gracefully...\n");
-                    updateCheckpointState(
-                        &checkpoint, hash_choice, attack_mode, min_len, max_len, len,
-                        offset, total_scanned, fixed_limit, wall_start,
-                        hex_input, salt_input, wordlist_path
-                    );
-                    saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
-                    return 130;
-                }
-
                 if (difftime(time(NULL), wall_start) > 43200 || (fixed_limit > 0 && total_scanned >= fixed_limit)) break;
 
-                // Distribute workload across GPUs
-                const int base_blocks = blocks / device_count;
-                const int extra_blocks = blocks % device_count;
-                uint64_t dispatched_work = 0;
-
+                // Distribute workload across GPUs with asynchronous streams
+                uint64_t gpu_stride = batch_size * device_count;
                 for (int dev = 0; dev < device_count; dev++) {
-                    CUDA_CHECK(cudaSetDevice(dev));
-                    int h_found_reset = 0;
-                    CUDA_CHECK(cudaMemcpyToSymbol(d_found, &h_found_reset, sizeof(int)));
+                    cudaSetDevice(dev);
+                    uint64_t dev_offset = offset + (dev * batch_size);
 
-                    int dev_blocks = base_blocks + (dev < extra_blocks ? 1 : 0);
-                    if (dev_blocks == 0) continue;
+                    if (dev_offset >= max_idx) break;
 
-                    uint64_t dev_work = (uint64_t)dev_blocks * threads * iterations;
-                    uint64_t dev_offset = offset + dispatched_work;
-                    crackKernel<<<dev_blocks, threads>>>(dev_offset, len, iterations, hash_choice);
-                    CUDA_CHECK(cudaGetLastError());
-                    dispatched_work += dev_work;
+                    uint64_t remaining = max_idx - dev_offset;
+                    uint64_t dev_iterations = (remaining < batch_size) ?
+                                          (remaining / (blocks * threads)) : iterations;
+                    if (dev_iterations == 0) dev_iterations = 1;
+
+                    // Use specialized kernels with asynchronous streams
+                    switch(hash_choice) {
+                        case 1: case 2: crackSHA256<<<blocks, threads, 0, streams[dev]>>>(dev_offset, len, dev_iterations); break;
+                        case 3: crackMD5<<<blocks, threads, 0, streams[dev]>>>(dev_offset, len, dev_iterations); break;
+                        case 4: crackSHA1<<<blocks, threads, 0, streams[dev]>>>(dev_offset, len, dev_iterations); break;
+                        case 5: crackNTLM<<<blocks, threads, 0, streams[dev]>>>(dev_offset, len, dev_iterations); break;
+                        case 6: crackMySQL41<<<blocks, threads, 0, streams[dev]>>>(dev_offset, len, dev_iterations); break;
+                        default: crackKernel<<<blocks, threads, 0, streams[dev]>>>(dev_offset, len, dev_iterations, hash_choice); break;
+                    }
+                    KERNEL_CHECK();
                 }
 
-                // Synchronize all GPUs and check for found using host-side flag
-                h_found_flag = 0;
+                // Synchronize all GPU streams
                 for (int dev = 0; dev < device_count; dev++) {
-                    CUDA_CHECK(cudaSetDevice(dev));
-                    CUDA_CHECK(cudaDeviceSynchronize());
-                    int dev_found = 0;
-                    CUDA_CHECK(cudaMemcpyFromSymbol(&dev_found, d_found, sizeof(int)));
-                    if (dev_found) {
-                        h_found_flag = 1;
+                    cudaSetDevice(dev);
+                    CUDA_CHECK(cudaStreamSynchronize(streams[dev]));
+                    cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int));
+                    if (h_found) {
                         char res[32];
-                        CUDA_CHECK(cudaMemcpyFromSymbol(res, d_result, 32));
+                        cudaMemcpyFromSymbol(res, d_result, 32);
                         printf("\n\n🎉 FOUND! Password: %s (GPU %d)\n", res, dev);
                         addToPotfile("nexo.potfile", hex_input, res);
+
+                        // Cleanup streams
+                        for (int d = 0; d < device_count; d++) {
+                            cudaSetDevice(d);
+                            cudaStreamDestroy(streams[d]);
+                        }
+                        free(streams);
+                        if (nvml_available) shutdownNVML();
                         return 0;
                     }
                 }
 
                 // Update and display stats
                 updateStats(&stats, total_scanned);
+
+                // Get GPU stats if NVML available
+                if (nvml_available && offset % (batch_size * 5) == 0) {
+                    GPUStats gpu_stats = getGPUStats(0);
+                    printf("\r🌡️ %d°C | ⚡ %uW | 🌀 %u%%  ",
+                           gpu_stats.temperature, gpu_stats.power_draw / 1000, gpu_stats.utilization);
+                    fflush(stdout);
+                }
+
                 if (offset % (batch_size * 5) == 0) displayStats(&stats);
 
                 // Save checkpoint every 5 minutes
                 if (difftime(time(NULL), last_checkpoint) > 300) {
-                    updateCheckpointState(
-                        &checkpoint, hash_choice, attack_mode, min_len, max_len, len,
-                        offset, total_scanned, fixed_limit, wall_start,
-                        hex_input, salt_input, wordlist_path
-                    );
+                    checkpoint.hash_choice = hash_choice;
+                    checkpoint.attack_mode = attack_mode;
+                    checkpoint.min_len = min_len;
+                    checkpoint.max_len = max_len;
+                    checkpoint.current_len = len;
+                    checkpoint.offset = offset;
+                    checkpoint.total_scanned = total_scanned;
+                    checkpoint.fixed_limit = fixed_limit;
+                    checkpoint.start_time = wall_start;
+                    strcpy(checkpoint.hex_input, hex_input);
+                    strcpy(checkpoint.salt_input, salt_input);
+                    strcpy(checkpoint.wordlist_path, wordlist_path);
+                    checkpoint.salt_len = strlen(salt_input);
                     saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
                     last_checkpoint = time(NULL);
                 }
 
-                offset += dispatched_work;
-                total_scanned += dispatched_work;
+                offset += gpu_stride; total_scanned += gpu_stride;
             }
         }
-        printf("\n❌ Not found.\n"); return 0;
+
+        // Cleanup streams
+        for (int dev = 0; dev < device_count; dev++) {
+            cudaSetDevice(dev);
+            cudaStreamDestroy(streams[dev]);
+        }
+        free(streams);
+
+        printf("\n❌ Not found.\n");
+        if (nvml_available) shutdownNVML();
+        return 0;
+    }
+}
+len(salt_input);
+                    saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
+                    last_checkpoint = time(NULL);
+                }
+
+                offset += gpu_stride; total_scanned += gpu_stride;
+            }
+        }
+
+        // Cleanup streams
+        for (int dev = 0; dev < device_count; dev++) {
+            cudaSetDevice(dev);
+            cudaStreamDestroy(streams[dev]);
+        }
+        free(streams);
+
+        printf("\n❌ Not found.\n");
+        if (nvml_available) shutdownNVML();
+        return 0;
     }
 }
