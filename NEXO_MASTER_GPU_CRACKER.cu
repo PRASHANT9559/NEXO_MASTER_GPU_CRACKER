@@ -1,5 +1,5 @@
 
-+++ NEXO_MASTER_GPU_CRACKER.cu (修改后)
++++ NEXO_MASTER_GPU_CRACKER.cu
 #include <stdio.h>
 #include <cuda_runtime.h>
 #include <stdlib.h>
