@@ -7,6 +7,18 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <sys/types.h>
+#include <signal.h>
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t _err = (call); \
+    if (_err != cudaSuccess) { \
+        fprintf(stderr, "\n❌ CUDA Error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
+
+#define DEFAULT_CHUNK_SIZE (50 * 1024 * 1024)
 
 // --- Constant Memory ---
 __constant__ uint8_t c_target[32];
@@ -61,35 +73,32 @@ __device__ void sha256_transform(uint32_t *state, const uint8_t *chunk) {
 
 __device__ void sha256_hash(const char *input, int len, uint8_t *output) {
     uint32_t h[8] = {0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,0x510e527f,0x9b05688c,0x1f83d9ab,0x5be0cd19};
-    uint8_t chunk[64] = {0};
+    int offset = 0;
 
-    // Handle multi-block padding for inputs >= 56 bytes
-    if (len >= 56) {
-        // First block: copy as much as fits, add 0x80
-        for(int i=0; i<len && i<56; i++) chunk[i] = (uint8_t)input[i];
-        chunk[55] = 0x80;
-        // Zero out remaining bytes in first block (except last 8 for length)
-        for(int i=56; i<64; i++) chunk[i] = 0;
-        sha256_transform(h, chunk);
-
-        // Second block: copy remaining input data
-        for(int i=0; i<64; i++) chunk[i] = 0;
-        int remaining = len - 55;
-        for(int i=0; i<remaining; i++) chunk[i] = (uint8_t)input[55 + i];
-        // Add 0x80 after remaining data
-        chunk[remaining] = 0x80;
-        // Set bit length at end
-        uint64_t bits = (uint64_t)len * 8;
-        for(int i=0;i<8;i++) chunk[63-i] = (bits >> (i*8)) & 0xFF;
-        sha256_transform(h, chunk);
-    } else {
-        // Single block case (original logic)
-        for(int i=0; i<len; i++) chunk[i] = (uint8_t)input[i];
-        chunk[len] = 0x80;
-        uint64_t bits = (uint64_t)len * 8;
-        for(int i=0;i<8;i++) chunk[63-i] = (bits >> (i*8)) & 0xFF;
-        sha256_transform(h, chunk);
+    // Process all full 64-byte chunks first.
+    while (len - offset >= 64) {
+        sha256_transform(h, (const uint8_t*)(input + offset));
+        offset += 64;
     }
+
+    // FIPS 180-4 compliant padding for remaining bytes.
+    uint8_t final_blocks[128] = {0};
+    int remaining = len - offset;
+    for (int i = 0; i < remaining; i++) {
+        final_blocks[i] = (uint8_t)input[offset + i];
+    }
+    final_blocks[remaining] = 0x80;
+
+    int final_block_count = (remaining <= 55) ? 1 : 2;
+    uint64_t bits = (uint64_t)len * 8;
+    int len_pos = final_block_count * 64 - 8;
+    for (int i = 0; i < 8; i++) {
+        final_blocks[len_pos + 7 - i] = (uint8_t)((bits >> (i * 8)) & 0xFF);
+    }
+
+    sha256_transform(h, final_blocks);
+    if (final_block_count == 2) sha256_transform(h, final_blocks + 64);
+
     for(int i=0;i<8;i++) {
         output[i*4] = (h[i] >> 24) & 0xFF; output[i*4+1] = (h[i] >> 16) & 0xFF;
         output[i*4+2] = (h[i] >> 8) & 0xFF; output[i*4+3] = h[i] & 0xFF;
@@ -410,6 +419,7 @@ __device__ char d_result[32];
 
 // Host-side flag for multi-GPU synchronization
 static int h_found_flag = 0;
+static volatile sig_atomic_t g_stop_requested = 0;
 
 // --- Checkpoint State ---
 typedef struct {
@@ -458,6 +468,41 @@ void saveCheckpoint(const char* filename, CheckpointState* state) {
         fclose(fp);
         printf("\n💾 Checkpoint saved to %s\n", filename);
     }
+}
+
+void handleSigint(int signo) {
+    (void)signo;
+    g_stop_requested = 1;
+}
+
+void updateCheckpointState(
+    CheckpointState* checkpoint,
+    int hash_choice,
+    int attack_mode,
+    int min_len,
+    int max_len,
+    int current_len,
+    uint64_t offset,
+    uint64_t total_scanned,
+    uint64_t fixed_limit,
+    time_t wall_start,
+    const char* hex_input,
+    const char* salt_input,
+    const char* wordlist_path
+) {
+    checkpoint->hash_choice = hash_choice;
+    checkpoint->attack_mode = attack_mode;
+    checkpoint->min_len = min_len;
+    checkpoint->max_len = max_len;
+    checkpoint->current_len = current_len;
+    checkpoint->offset = offset;
+    checkpoint->total_scanned = total_scanned;
+    checkpoint->fixed_limit = fixed_limit;
+    checkpoint->start_time = wall_start;
+    strcpy(checkpoint->hex_input, hex_input);
+    strcpy(checkpoint->salt_input, salt_input);
+    strcpy(checkpoint->wordlist_path, wordlist_path);
+    checkpoint->salt_len = strlen(salt_input);
 }
 
 int loadCheckpoint(const char* filename, CheckpointState* state) {
@@ -858,6 +903,8 @@ __global__ void maskKernel(uint64_t offset, int type) {
 }
 
 int main() {
+    signal(SIGINT, handleSigint);
+
     char hex_input[128];
     char wordlist_path[256];
     char salt_input[64];
@@ -1018,71 +1065,138 @@ int main() {
         struct stat st;
         stat(wordlist_path, &st);
         long file_size = st.st_size;
+        size_t chunk_size = DEFAULT_CHUNK_SIZE;
+        size_t total_chunks = (file_size > 0) ? (size_t)((file_size + (long)chunk_size - 1) / (long)chunk_size) : 1;
 
-        // Load entire wordlist (no 1MB limit now)
-        char* wordlist_buffer = (char*)malloc(file_size + 1);
-        fread(wordlist_buffer, 1, file_size, fp);
-        wordlist_buffer[file_size] = '\0';
-        fclose(fp);
+        // Allocate reusable host/GPU buffers for chunked dictionary processing.
+        char* chunk_buffer = (char*)malloc(chunk_size + 512);
+        char carry_over[256] = {0};
+        int carry_len = 0;
 
-        // Pre-compute word indices on CPU
-        int word_count = 0;
-        for (int i = 0; i < file_size; i++) {
-            if (wordlist_buffer[i] == '\n') word_count++;
+        if (!chunk_buffer) {
+            fclose(fp);
+            printf("\n❌ Error: Failed to allocate dictionary chunk buffer.\n");
+            return 1;
         }
 
-        uint32_t* word_indices = (uint32_t*)malloc((word_count + 1) * sizeof(uint32_t));
-        int current_word = 0;
-        word_indices[0] = 0;
-        for (int i = 0; i < file_size && current_word < word_count; i++) {
-            if (wordlist_buffer[i] == '\n') {
-                word_indices[++current_word] = i + 1;
-            }
-        }
+        char* d_wordlist_ptr = NULL;
+        uint32_t* d_word_indices_ptr = NULL;
+        CUDA_CHECK(cudaMalloc(&d_wordlist_ptr, chunk_size + 512));
+        CUDA_CHECK(cudaMalloc(&d_word_indices_ptr, (chunk_size + 2) * sizeof(uint32_t)));
 
-        // Allocate GPU memory
-        char* d_wordlist_ptr;
-        uint32_t* d_word_indices_ptr;
-        cudaMalloc(&d_wordlist_ptr, file_size + 1);
-        cudaMalloc(&d_word_indices_ptr, (word_count + 1) * sizeof(uint32_t));
+        int h_found = 0;
+        CUDA_CHECK(cudaMemcpyToSymbol(d_found, &h_found, sizeof(int)));
 
-        // Copy to GPU
-        cudaMemcpy(d_wordlist_ptr, wordlist_buffer, file_size + 1, cudaMemcpyHostToDevice);
-        cudaMemcpy(d_word_indices_ptr, word_indices, (word_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice);
-
-        // Set device pointers
-        cudaMemcpyToSymbol(d_wordlist, &d_wordlist_ptr, sizeof(char*));
-        cudaMemcpyToSymbol(d_word_indices, &d_word_indices_ptr, sizeof(uint32_t*));
-        cudaMemcpyToSymbol(d_wordlist_size, &file_size, sizeof(int));
-        cudaMemcpyToSymbol(d_wordlist_count, &word_count, sizeof(int));
-
-        free(wordlist_buffer);
-        free(word_indices);
-
-        printf("\n📚 Loaded %d words from wordlist (%.2f MB)\n", word_count, (double)file_size / (1024 * 1024));
-        printf("🔍 Starting Dictionary Attack...\n");
-
-        int threads = 256;
-        int blocks = (word_count + threads - 1) / threads;
         time_t dict_start = time(NULL);
         StatsState dict_stats;
-        initStats(&dict_stats, word_count, dict_start);
+        initStats(&dict_stats, 0, dict_start);
 
-        dictionaryKernel<<<blocks, threads>>>(hash_choice);
-        cudaDeviceSynchronize();
+        printf("\n📚 Starting Chunked Dictionary Attack (chunk size: %.2f MB)\n", (double)chunk_size / (1024 * 1024));
 
-        updateStats(&dict_stats, word_count);
+        uint64_t total_words_processed = 0;
+        size_t chunk_idx = 0;
+
+        while (!feof(fp) || carry_len > 0) {
+            if (g_stop_requested) {
+                printf("\n\n🛑 SIGINT received during dictionary mode. Stopping safely...\n");
+                break;
+            }
+
+            // Bring carry-over to beginning of buffer before reading next chunk.
+            if (carry_len > 0) memcpy(chunk_buffer, carry_over, carry_len);
+            size_t bytes_read = fread(chunk_buffer + carry_len, 1, chunk_size - carry_len, fp);
+            size_t total_bytes = bytes_read + carry_len;
+            if (total_bytes == 0) break;
+
+            chunk_idx++;
+            size_t process_bytes = total_bytes;
+
+            // If we are not at EOF, keep partial trailing word for the next chunk.
+            if (!feof(fp)) {
+                ssize_t last_nl = -1;
+                for (ssize_t i = (ssize_t)total_bytes - 1; i >= 0; i--) {
+                    if (chunk_buffer[i] == '\n') { last_nl = i; break; }
+                }
+                if (last_nl >= 0) {
+                    process_bytes = (size_t)last_nl + 1;
+                    carry_len = (int)(total_bytes - process_bytes);
+                    if (carry_len >= (int)sizeof(carry_over)) {
+                        // Fallback for unusually long single trailing token.
+                        carry_len = 0;
+                    } else if (carry_len > 0) {
+                        memcpy(carry_over, chunk_buffer + process_bytes, carry_len);
+                    }
+                } else {
+                    // Extremely long single line; process it as-is to avoid stalling.
+                    carry_len = 0;
+                }
+            } else {
+                carry_len = 0;
+            }
+
+            if (process_bytes == 0) continue;
+
+            // Ensure final line in this processed chunk is terminated.
+            if (chunk_buffer[process_bytes - 1] != '\n') {
+                chunk_buffer[process_bytes++] = '\n';
+            }
+            chunk_buffer[process_bytes] = '\0';
+
+            int word_count = 0;
+            for (size_t i = 0; i < process_bytes; i++) {
+                if (chunk_buffer[i] == '\n') word_count++;
+            }
+            if (word_count == 0) continue;
+
+            uint32_t* word_indices = (uint32_t*)malloc((word_count + 1) * sizeof(uint32_t));
+            if (!word_indices) {
+                printf("\n❌ Error: Failed to allocate word indices.\n");
+                break;
+            }
+
+            int current_word = 0;
+            word_indices[0] = 0;
+            for (size_t i = 0; i < process_bytes && current_word < word_count; i++) {
+                if (chunk_buffer[i] == '\n') word_indices[++current_word] = (uint32_t)i + 1;
+            }
+
+            CUDA_CHECK(cudaMemcpy(d_wordlist_ptr, chunk_buffer, process_bytes + 1, cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpy(d_word_indices_ptr, word_indices, (word_count + 1) * sizeof(uint32_t), cudaMemcpyHostToDevice));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist, &d_wordlist_ptr, sizeof(char*)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_word_indices, &d_word_indices_ptr, sizeof(uint32_t*)));
+            int process_bytes_i = (int)process_bytes;
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_size, &process_bytes_i, sizeof(int)));
+            CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_count, &word_count, sizeof(int)));
+
+            int threads = 256;
+            int blocks = (word_count + threads - 1) / threads;
+            dictionaryKernel<<<blocks, threads>>>(hash_choice);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaDeviceSynchronize());
+
+            total_words_processed += word_count;
+            dict_stats.total_hashes = total_words_processed;
+            updateStats(&dict_stats, total_words_processed);
+            printf("\r📦 Processing chunk %zu/%zu | words: %d | total words: %lu",
+                   chunk_idx, total_chunks, word_count, total_words_processed);
+            fflush(stdout);
+
+            CUDA_CHECK(cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int)));
+            free(word_indices);
+            if (h_found) break;
+        }
+
+        printf("\n");
         displayStats(&dict_stats);
 
-        cudaMemcpyFromSymbol(&h_found, d_found, sizeof(int));
-
-        // Cleanup GPU memory
-        cudaFree(d_wordlist_ptr);
-        cudaFree(d_word_indices_ptr);
+        fclose(fp);
+        free(chunk_buffer);
+        CUDA_CHECK(cudaFree(d_wordlist_ptr));
+        CUDA_CHECK(cudaFree(d_word_indices_ptr));
 
         if (h_found) {
             char res[64];
-            cudaMemcpyFromSymbol(res, d_result, 64);
+            CUDA_CHECK(cudaMemcpyFromSymbol(res, d_result, 64));
             printf("\n🎉 FOUND! Password: %s\n", res);
             addToPotfile("nexo.potfile", hex_input, res);
             return 0;
@@ -1097,8 +1211,8 @@ int main() {
 
         const char* h_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*";
         int h_charset_len = strlen(h_charset);
-        cudaMemcpyToSymbol(c_charset, h_charset, h_charset_len + 1);
-        cudaMemcpyToSymbol(c_charset_len, &h_charset_len, sizeof(int));
+        CUDA_CHECK(cudaMemcpyToSymbol(c_charset, h_charset, h_charset_len + 1));
+        CUDA_CHECK(cudaMemcpyToSymbol(c_charset_len, &h_charset_len, sizeof(int)));
 
         int threads = 256, blocks = 2048, iterations = 5000;
         uint64_t batch_size = (uint64_t)blocks * threads * iterations;
@@ -1107,7 +1221,11 @@ int main() {
 
         // Multi-GPU Support
         int device_count;
-        cudaGetDeviceCount(&device_count);
+        CUDA_CHECK(cudaGetDeviceCount(&device_count));
+        if (device_count < 1) {
+            fprintf(stderr, "\n❌ No CUDA-capable GPU found.\n");
+            return 1;
+        }
         printf("\n🖥️  Detected %d GPU(s)\n", device_count);
 
         if (device_count > 1) {
@@ -1128,26 +1246,50 @@ int main() {
             initStats(&stats, max_idx, wall_start);
 
             while (offset < max_idx) {
+                if (g_stop_requested) {
+                    printf("\n\n🛑 SIGINT received. Saving checkpoint and exiting gracefully...\n");
+                    updateCheckpointState(
+                        &checkpoint, hash_choice, attack_mode, min_len, max_len, len,
+                        offset, total_scanned, fixed_limit, wall_start,
+                        hex_input, salt_input, wordlist_path
+                    );
+                    saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
+                    return 130;
+                }
+
                 if (difftime(time(NULL), wall_start) > 43200 || (fixed_limit > 0 && total_scanned >= fixed_limit)) break;
 
                 // Distribute workload across GPUs
+                const int base_blocks = blocks / device_count;
+                const int extra_blocks = blocks % device_count;
+                uint64_t dispatched_work = 0;
+
                 for (int dev = 0; dev < device_count; dev++) {
-                    cudaSetDevice(dev);
-                    uint64_t dev_offset = offset + (dev * batch_size / device_count);
-                    crackKernel<<<blocks / device_count, threads>>>(dev_offset, len, iterations, hash_choice);
+                    CUDA_CHECK(cudaSetDevice(dev));
+                    int h_found_reset = 0;
+                    CUDA_CHECK(cudaMemcpyToSymbol(d_found, &h_found_reset, sizeof(int)));
+
+                    int dev_blocks = base_blocks + (dev < extra_blocks ? 1 : 0);
+                    if (dev_blocks == 0) continue;
+
+                    uint64_t dev_work = (uint64_t)dev_blocks * threads * iterations;
+                    uint64_t dev_offset = offset + dispatched_work;
+                    crackKernel<<<dev_blocks, threads>>>(dev_offset, len, iterations, hash_choice);
+                    CUDA_CHECK(cudaGetLastError());
+                    dispatched_work += dev_work;
                 }
 
                 // Synchronize all GPUs and check for found using host-side flag
                 h_found_flag = 0;
                 for (int dev = 0; dev < device_count; dev++) {
-                    cudaSetDevice(dev);
-                    cudaDeviceSynchronize();
+                    CUDA_CHECK(cudaSetDevice(dev));
+                    CUDA_CHECK(cudaDeviceSynchronize());
                     int dev_found = 0;
-                    cudaMemcpyFromSymbol(&dev_found, d_found, sizeof(int));
+                    CUDA_CHECK(cudaMemcpyFromSymbol(&dev_found, d_found, sizeof(int)));
                     if (dev_found) {
                         h_found_flag = 1;
                         char res[32];
-                        cudaMemcpyFromSymbol(res, d_result, 32);
+                        CUDA_CHECK(cudaMemcpyFromSymbol(res, d_result, 32));
                         printf("\n\n🎉 FOUND! Password: %s (GPU %d)\n", res, dev);
                         addToPotfile("nexo.potfile", hex_input, res);
                         return 0;
@@ -1160,24 +1302,17 @@ int main() {
 
                 // Save checkpoint every 5 minutes
                 if (difftime(time(NULL), last_checkpoint) > 300) {
-                    checkpoint.hash_choice = hash_choice;
-                    checkpoint.attack_mode = attack_mode;
-                    checkpoint.min_len = min_len;
-                    checkpoint.max_len = max_len;
-                    checkpoint.current_len = len;
-                    checkpoint.offset = offset;
-                    checkpoint.total_scanned = total_scanned;
-                    checkpoint.fixed_limit = fixed_limit;
-                    checkpoint.start_time = wall_start;
-                    strcpy(checkpoint.hex_input, hex_input);
-                    strcpy(checkpoint.salt_input, salt_input);
-                    strcpy(checkpoint.wordlist_path, wordlist_path);
-                    checkpoint.salt_len = strlen(salt_input);
+                    updateCheckpointState(
+                        &checkpoint, hash_choice, attack_mode, min_len, max_len, len,
+                        offset, total_scanned, fixed_limit, wall_start,
+                        hex_input, salt_input, wordlist_path
+                    );
                     saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
                     last_checkpoint = time(NULL);
                 }
 
-                offset += batch_size; total_scanned += batch_size;
+                offset += dispatched_work;
+                total_scanned += dispatched_work;
             }
         }
         printf("\n❌ Not found.\n"); return 0;
