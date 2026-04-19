@@ -7,6 +7,15 @@
 #include <string.h>
 #include <stdint.h>
 #include <sys/stat.h>
+#include <signal.h>
+
+#define CUDA_CHECK(call) do { \
+    cudaError_t _err = (call); \
+    if (_err != cudaSuccess) { \
+        fprintf(stderr, "\n❌ CUDA Error at %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(_err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while (0)
 
 // --- Constant Memory ---
 __constant__ uint8_t c_target[32];
@@ -410,6 +419,7 @@ __device__ char d_result[32];
 
 // Host-side flag for multi-GPU synchronization
 static int h_found_flag = 0;
+static volatile sig_atomic_t g_stop_requested = 0;
 
 // --- Checkpoint State ---
 typedef struct {
@@ -458,6 +468,41 @@ void saveCheckpoint(const char* filename, CheckpointState* state) {
         fclose(fp);
         printf("\n💾 Checkpoint saved to %s\n", filename);
     }
+}
+
+void handleSigint(int signo) {
+    (void)signo;
+    g_stop_requested = 1;
+}
+
+void updateCheckpointState(
+    CheckpointState* checkpoint,
+    int hash_choice,
+    int attack_mode,
+    int min_len,
+    int max_len,
+    int current_len,
+    uint64_t offset,
+    uint64_t total_scanned,
+    uint64_t fixed_limit,
+    time_t wall_start,
+    const char* hex_input,
+    const char* salt_input,
+    const char* wordlist_path
+) {
+    checkpoint->hash_choice = hash_choice;
+    checkpoint->attack_mode = attack_mode;
+    checkpoint->min_len = min_len;
+    checkpoint->max_len = max_len;
+    checkpoint->current_len = current_len;
+    checkpoint->offset = offset;
+    checkpoint->total_scanned = total_scanned;
+    checkpoint->fixed_limit = fixed_limit;
+    checkpoint->start_time = wall_start;
+    strcpy(checkpoint->hex_input, hex_input);
+    strcpy(checkpoint->salt_input, salt_input);
+    strcpy(checkpoint->wordlist_path, wordlist_path);
+    checkpoint->salt_len = strlen(salt_input);
 }
 
 int loadCheckpoint(const char* filename, CheckpointState* state) {
@@ -858,6 +903,8 @@ __global__ void maskKernel(uint64_t offset, int type) {
 }
 
 int main() {
+    signal(SIGINT, handleSigint);
+
     char hex_input[128];
     char wordlist_path[256];
     char salt_input[64];
@@ -1097,8 +1144,8 @@ int main() {
 
         const char* h_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*";
         int h_charset_len = strlen(h_charset);
-        cudaMemcpyToSymbol(c_charset, h_charset, h_charset_len + 1);
-        cudaMemcpyToSymbol(c_charset_len, &h_charset_len, sizeof(int));
+        CUDA_CHECK(cudaMemcpyToSymbol(c_charset, h_charset, h_charset_len + 1));
+        CUDA_CHECK(cudaMemcpyToSymbol(c_charset_len, &h_charset_len, sizeof(int)));
 
         int threads = 256, blocks = 2048, iterations = 5000;
         uint64_t batch_size = (uint64_t)blocks * threads * iterations;
@@ -1107,7 +1154,11 @@ int main() {
 
         // Multi-GPU Support
         int device_count;
-        cudaGetDeviceCount(&device_count);
+        CUDA_CHECK(cudaGetDeviceCount(&device_count));
+        if (device_count < 1) {
+            fprintf(stderr, "\n❌ No CUDA-capable GPU found.\n");
+            return 1;
+        }
         printf("\n🖥️  Detected %d GPU(s)\n", device_count);
 
         if (device_count > 1) {
@@ -1128,26 +1179,50 @@ int main() {
             initStats(&stats, max_idx, wall_start);
 
             while (offset < max_idx) {
+                if (g_stop_requested) {
+                    printf("\n\n🛑 SIGINT received. Saving checkpoint and exiting gracefully...\n");
+                    updateCheckpointState(
+                        &checkpoint, hash_choice, attack_mode, min_len, max_len, len,
+                        offset, total_scanned, fixed_limit, wall_start,
+                        hex_input, salt_input, wordlist_path
+                    );
+                    saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
+                    return 130;
+                }
+
                 if (difftime(time(NULL), wall_start) > 43200 || (fixed_limit > 0 && total_scanned >= fixed_limit)) break;
 
                 // Distribute workload across GPUs
+                const int base_blocks = blocks / device_count;
+                const int extra_blocks = blocks % device_count;
+                uint64_t dispatched_work = 0;
+
                 for (int dev = 0; dev < device_count; dev++) {
-                    cudaSetDevice(dev);
-                    uint64_t dev_offset = offset + (dev * batch_size / device_count);
-                    crackKernel<<<blocks / device_count, threads>>>(dev_offset, len, iterations, hash_choice);
+                    CUDA_CHECK(cudaSetDevice(dev));
+                    int h_found_reset = 0;
+                    CUDA_CHECK(cudaMemcpyToSymbol(d_found, &h_found_reset, sizeof(int)));
+
+                    int dev_blocks = base_blocks + (dev < extra_blocks ? 1 : 0);
+                    if (dev_blocks == 0) continue;
+
+                    uint64_t dev_work = (uint64_t)dev_blocks * threads * iterations;
+                    uint64_t dev_offset = offset + dispatched_work;
+                    crackKernel<<<dev_blocks, threads>>>(dev_offset, len, iterations, hash_choice);
+                    CUDA_CHECK(cudaGetLastError());
+                    dispatched_work += dev_work;
                 }
 
                 // Synchronize all GPUs and check for found using host-side flag
                 h_found_flag = 0;
                 for (int dev = 0; dev < device_count; dev++) {
-                    cudaSetDevice(dev);
-                    cudaDeviceSynchronize();
+                    CUDA_CHECK(cudaSetDevice(dev));
+                    CUDA_CHECK(cudaDeviceSynchronize());
                     int dev_found = 0;
-                    cudaMemcpyFromSymbol(&dev_found, d_found, sizeof(int));
+                    CUDA_CHECK(cudaMemcpyFromSymbol(&dev_found, d_found, sizeof(int)));
                     if (dev_found) {
                         h_found_flag = 1;
                         char res[32];
-                        cudaMemcpyFromSymbol(res, d_result, 32);
+                        CUDA_CHECK(cudaMemcpyFromSymbol(res, d_result, 32));
                         printf("\n\n🎉 FOUND! Password: %s (GPU %d)\n", res, dev);
                         addToPotfile("nexo.potfile", hex_input, res);
                         return 0;
@@ -1160,24 +1235,17 @@ int main() {
 
                 // Save checkpoint every 5 minutes
                 if (difftime(time(NULL), last_checkpoint) > 300) {
-                    checkpoint.hash_choice = hash_choice;
-                    checkpoint.attack_mode = attack_mode;
-                    checkpoint.min_len = min_len;
-                    checkpoint.max_len = max_len;
-                    checkpoint.current_len = len;
-                    checkpoint.offset = offset;
-                    checkpoint.total_scanned = total_scanned;
-                    checkpoint.fixed_limit = fixed_limit;
-                    checkpoint.start_time = wall_start;
-                    strcpy(checkpoint.hex_input, hex_input);
-                    strcpy(checkpoint.salt_input, salt_input);
-                    strcpy(checkpoint.wordlist_path, wordlist_path);
-                    checkpoint.salt_len = strlen(salt_input);
+                    updateCheckpointState(
+                        &checkpoint, hash_choice, attack_mode, min_len, max_len, len,
+                        offset, total_scanned, fixed_limit, wall_start,
+                        hex_input, salt_input, wordlist_path
+                    );
                     saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
                     last_checkpoint = time(NULL);
                 }
 
-                offset += batch_size; total_scanned += batch_size;
+                offset += dispatched_work;
+                total_scanned += dispatched_work;
             }
         }
         printf("\n❌ Not found.\n"); return 0;
