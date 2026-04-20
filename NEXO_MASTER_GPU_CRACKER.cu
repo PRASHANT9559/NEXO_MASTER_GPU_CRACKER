@@ -218,7 +218,7 @@ __device__ uint32_t md4_F(uint32_t x, uint32_t y, uint32_t z) { return (x & y) |
 __device__ uint32_t md4_G(uint32_t x, uint32_t y, uint32_t z) { return (x & y) | (x & z) | (y & z); }
 __device__ uint32_t md4_H(uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z; }
 
-__device__ uint32_t ROTL(uint32_t x, uint32_t n) { return (x << n) | (x >> (32 - n)); }
+// ROTL macro from MD5 engine is reused here
 
 __device__ void md4_transform(uint32_t *state, const uint8_t *chunk) {
     uint32_t W[16];
@@ -360,13 +360,7 @@ typedef struct {
 } CheckpointState;
 
 // --- Real-time Stats ---
-typedef struct {
-    uint64_t hashes_per_second;
-    double eta_seconds;
-    double progress_percent;
-    time_t last_update;
-    uint64_t total_hashes;
-} StatsState;
+// StatsState struct is defined later in the file
 
 // --- NVML GPU Monitoring ---
 typedef struct {
@@ -683,6 +677,8 @@ void displayStats(StatsState* stats) {
 
     fflush(stdout);
 }
+
+__global__ void crackKernel(uint64_t offset, int len, int iterations, int type);
 
 void runBenchmark() {
     printf("\n========================================\n");
@@ -1418,25 +1414,25 @@ void estimateHashRate() {
     printf("\n========================================\n");
     printf("   📈 HASH RATE ESTIMATOR\n");
     printf("========================================\n\n");
-    
+
     int device_count;
     cudaGetDeviceCount(&device_count);
-    
+
     printf("Detected %d GPU(s). Running quick tests...\n\n", device_count);
-    
+
     // Quick test logic (similar to benchmark but shorter)
     int threads = 256, blocks = 2048, iterations = 5000;
     uint64_t batch_size = (uint64_t)blocks * threads * iterations;
-    
+
     for (int type = 1; type <= 5; type++) {
         clock_t start = clock();
         crackKernel<<<blocks, threads>>>(0, 6, iterations, type);
         cudaDeviceSynchronize();
         clock_t end = clock();
-        
+
         double elapsed = (double)(end - start) / CLOCKS_PER_SEC;
         double hps = batch_size / elapsed;
-        
+
         char hps_str[32];
         formatNumber((uint64_t)hps, hps_str, sizeof(hps_str));
         printf("Type %d Estimated Speed: %sH/s\n", type, hps_str);
@@ -1559,7 +1555,7 @@ int main() {
     }
 
     if (!is_resume) {
-        printf("\n[1] Enter Target Hash: "); scanf("%s", hex_input);
+        printf("\n[1] Enter Target Hash: "); scanf("%127s", hex_input);
         printf("\n[2] Select Hash Type:\n");
         printf("    1. SHA256 (64 hex)  2. SHA256 (32 hex)\n");
         printf("    3. MD5 (32 hex)     4. SHA-1 (40 hex)\n");
@@ -1575,7 +1571,7 @@ int main() {
 
     // Handle salt input for salted hash types
     if (hash_choice >= 7 && hash_choice <= 9) {
-        printf("\n[3] Enter Salt: "); scanf("%s", salt_input);
+        printf("\n[3] Enter Salt: "); scanf("%63s", salt_input);
         int salt_len = strlen(salt_input);
         cudaMemcpyToSymbol(c_salt, salt_input, salt_len + 1);
         cudaMemcpyToSymbol(c_salt_len, &salt_len, sizeof(int));
@@ -1603,7 +1599,7 @@ int main() {
 
     if (attack_mode == 3) {
         char mask_pattern[64];
-        printf("\n[5] Enter Mask Pattern (e.g., ?l?l?l?d?d): "); scanf("%s", mask_pattern);
+        printf("\n[5] Enter Mask Pattern (e.g., ?l?l?l?d?d): "); scanf("%63s", mask_pattern);
 
         // Custom charsets for ?1, ?2, ?3, ?4
         const char* custom_charsets[4] = {NULL, NULL, NULL, NULL};
@@ -1692,7 +1688,10 @@ int main() {
     }
 
     if (attack_mode == 2) {
-        printf("\n[6] Enter Wordlist Path: "); scanf("%s", wordlist_path);
+        printf("\n[6] Enter Wordlist Path: "); scanf("%255s", wordlist_path);
+
+        int apply_rules = 0;
+        printf("\n[7] Apply basic mutation rules to wordlist? (1=Yes, 0=No): "); scanf("%d", &apply_rules);
 
         FILE* fp = fopen(wordlist_path, "r");
         if (!fp) {
@@ -1786,9 +1785,10 @@ int main() {
             CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_size, (int*)&chunk_bytes, sizeof(int)));
             CUDA_CHECK(cudaMemcpyToSymbol(d_wordlist_count, &chunk_word_count, sizeof(int)));
 
-            // Launch kernel for this chunk (no rules by default, can be enabled via command line)
+            // Launch kernel for this chunk
             int blocks = (chunk_word_count + threads - 1) / threads;
-            dictionaryKernel<<<blocks, threads, 0, dict_stream>>>(hash_choice, 0, 0); // apply_rules=0, rule_count=0
+            int rules_to_apply = apply_rules ? 5 : 0;
+            dictionaryKernel<<<blocks, threads, 0, dict_stream>>>(hash_choice, apply_rules, rules_to_apply);
             KERNEL_CHECK();
             CUDA_CHECK(cudaStreamSynchronize(dict_stream));
 
@@ -1838,7 +1838,7 @@ int main() {
 
     if (attack_mode == 4) {
         // Hybrid Attack (Dictionary + Mask)
-        printf("\n[6] Enter Wordlist Path: "); scanf("%s", wordlist_path);
+        printf("\n[6] Enter Wordlist Path: "); scanf("%255s", wordlist_path);
 
         FILE* fp = fopen(wordlist_path, "r");
         if (!fp) {
@@ -1847,7 +1847,7 @@ int main() {
         }
 
         char mask_pattern[64];
-        printf("\n[7] Enter Mask Pattern (e.g., ?d?d): "); scanf("%s", mask_pattern);
+        printf("\n[7] Enter Mask Pattern (e.g., ?d?d): "); scanf("%63s", mask_pattern);
 
         // Custom charsets for ?1, ?2, ?3, ?4
         const char* custom_charsets[4] = {NULL, NULL, NULL, NULL};
@@ -2046,10 +2046,8 @@ int main() {
             printf("⚡ Using Multi-GPU mode with load balancing\n");
         }
 
-        // Auto-tune each GPU
-        for (int dev = 0; dev < device_count; dev++) {
-            autoTuneGPU(dev, &blocks, &threads);
-        }
+        // Auto-tune based on primary GPU (assumes homogeneous GPUs for balanced stride)
+        autoTuneGPU(0, &blocks, &threads);
 
         uint64_t batch_size = (uint64_t)blocks * threads * iterations;
         time_t wall_start = time(NULL); uint64_t total_scanned = 0;
@@ -2160,27 +2158,6 @@ int main() {
                     strcpy(checkpoint.salt_input, salt_input);
                     strcpy(checkpoint.wordlist_path, wordlist_path);
                     checkpoint.salt_len = strlen(salt_input);
-                    saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
-                    last_checkpoint = time(NULL);
-                }
-
-                offset += gpu_stride; total_scanned += gpu_stride;
-            }
-        }
-
-        // Cleanup streams
-        for (int dev = 0; dev < device_count; dev++) {
-            cudaSetDevice(dev);
-            cudaStreamDestroy(streams[dev]);
-        }
-        free(streams);
-
-        printf("\n❌ Not found.\n");
-        if (nvml_available) shutdownNVML();
-        return 0;
-    }
-}
-len(salt_input);
                     saveCheckpoint("nexo_checkpoint.bin", &checkpoint);
                     last_checkpoint = time(NULL);
                 }
