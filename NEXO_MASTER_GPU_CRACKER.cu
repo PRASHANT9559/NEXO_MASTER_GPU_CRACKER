@@ -996,8 +996,8 @@ __global__ void dictionaryKernel(int type, int apply_rules, int rule_count) {
     int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= d_wordlist_count) return;
 
-    // Coalesced memory access: load 4 bytes at a time using uint32_t*
-    uint32_t* d_wordlist_32 = (uint32_t*)d_wordlist;
+    // Coalesced memory access: load 4 bytes at a time using uint32_t* (Reserved for future optimization)
+    // uint32_t* d_wordlist_32 = (uint32_t*)d_wordlist;
 
     // O(1) word access using pre-computed indices
     uint32_t word_start = d_word_indices[idx];
