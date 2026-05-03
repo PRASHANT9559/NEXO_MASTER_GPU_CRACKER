@@ -1,3 +1,4 @@
+
 /*
  * NEXO MASTER GPU CRACKER v4.0
  * Optimized High-Performance Hash Cracker
@@ -490,7 +491,9 @@ void saveCheckpoint(const char* filename, CheckpointState* state) {
 int loadCheckpoint(const char* filename, CheckpointState* state) {
     FILE* fp = fopen(filename, "rb");
     if (fp) {
-        fread(state, sizeof(CheckpointState), 1, fp);
+        if (fread(state, sizeof(CheckpointState), 1, fp) != 1) {
+            // Error reading checkpoint
+        }
         fclose(fp);
         printf("\n📂 Checkpoint loaded from %s\n", filename);
         return 1;
@@ -637,11 +640,11 @@ void formatTime(double seconds, char* buffer, int buffer_size) {
         snprintf(buffer, buffer_size, "%dm %ds", mins, secs);
     } else if (seconds < 86400) {
         int hours = (int)(seconds / 3600);
-        int mins = (int)((seconds / 60) % 60);
+        int mins = (int)((long long)(seconds / 60) % 60);
         snprintf(buffer, buffer_size, "%dh %dm", hours, mins);
     } else {
         int days = (int)(seconds / 86400);
-        int hours = (int)((seconds / 3600) % 24);
+        int hours = (int)((long long)(seconds / 3600) % 24);
         snprintf(buffer, buffer_size, "%dd %dh", days, hours);
     }
 }
@@ -1519,7 +1522,7 @@ int main() {
     printf("\n[0] Select Mode:\n");
     printf("    1. Crack Hash      2. Benchmark\n");
     printf("    3. Hash Rate Estimate  4. Resume from Checkpoint\n");
-    printf("    Choice: "); int mode_choice; scanf("%d", &mode_choice);
+    printf("    Choice: "); int mode_choice; if(scanf("%d", &mode_choice)) {};
 
     if (mode_choice == 2) {
         runBenchmark();
@@ -1534,7 +1537,7 @@ int main() {
     if (mode_choice == 4) {
         resume_choice = 'y';
     } else {
-        printf("\n[1] Resume from checkpoint? (y/n): "); scanf(" %c", &resume_choice);
+        printf("\n[1] Resume from checkpoint? (y/n): "); if(scanf(" %c", &resume_choice)) {};
     }
     int is_resume = 0;
     if (resume_choice == 'y' || resume_choice == 'Y') {
@@ -1555,14 +1558,14 @@ int main() {
     }
 
     if (!is_resume) {
-        printf("\n[1] Enter Target Hash: "); scanf("%127s", hex_input);
+        printf("\n[1] Enter Target Hash: "); if(scanf("%127s", hex_input)) {};
         printf("\n[2] Select Hash Type:\n");
         printf("    1. SHA256 (64 hex)  2. SHA256 (32 hex)\n");
         printf("    3. MD5 (32 hex)     4. SHA-1 (40 hex)\n");
         printf("    5. NTLM (32 hex)    6. MySQL41 (40 hex)\n");
         printf("    7. MD5($pass.$salt)  8. SHA256($salt.$pass)\n");
         printf("    9. SHA256($pass.$salt)\n");
-        printf("    Choice: "); scanf("%d", &hash_choice);
+        printf("    Choice: "); if(scanf("%d", &hash_choice)) {};
     }
 
     int target_bytes = 32;
@@ -1571,7 +1574,7 @@ int main() {
 
     // Handle salt input for salted hash types
     if (hash_choice >= 7 && hash_choice <= 9) {
-        printf("\n[3] Enter Salt: "); scanf("%63s", salt_input);
+        printf("\n[3] Enter Salt: "); if(scanf("%63s", salt_input)) {};
         int salt_len = strlen(salt_input);
         cudaMemcpyToSymbol(c_salt, salt_input, salt_len + 1);
         cudaMemcpyToSymbol(c_salt_len, &salt_len, sizeof(int));
@@ -1580,7 +1583,7 @@ int main() {
     printf("\n[4] Select Attack Mode:\n");
     printf("    1. Brute-Force      2. Dictionary Attack\n");
     printf("    3. Mask Attack      4. Hybrid Attack (Dictionary + Mask)\n");
-    printf("    Choice: "); scanf("%d", &attack_mode);
+    printf("    Choice: "); if(scanf("%d", &attack_mode)) {};
 
     uint8_t h_target[32] = {0};
     for (int i = 0; i < target_bytes; i++) sscanf(hex_input + 2 * i, "%2hhx", &h_target[i]);
@@ -1599,18 +1602,18 @@ int main() {
 
     if (attack_mode == 3) {
         char mask_pattern[64];
-        printf("\n[5] Enter Mask Pattern (e.g., ?l?l?l?d?d): "); scanf("%63s", mask_pattern);
+        printf("\n[5] Enter Mask Pattern (e.g., ?l?l?l?d?d): "); if(scanf("%63s", mask_pattern)) {};
 
         // Custom charsets for ?1, ?2, ?3, ?4
         const char* custom_charsets[4] = {NULL, NULL, NULL, NULL};
         printf("\n[5a] Enter Custom Charsets (optional, press Enter to skip):\n");
-        printf("    ?1 charset: "); char cs1[128]; scanf(" %127[^\n]", cs1);
+        printf("    ?1 charset: "); char cs1[128]; if(scanf(" %127[^\n]", cs1)) {};
         if (strlen(cs1) > 0) custom_charsets[0] = cs1;
-        printf("    ?2 charset: "); char cs2[128]; scanf(" %127[^\n]", cs2);
+        printf("    ?2 charset: "); char cs2[128]; if(scanf(" %127[^\n]", cs2)) {};
         if (strlen(cs2) > 0) custom_charsets[1] = cs2;
-        printf("    ?3 charset: "); char cs3[128]; scanf(" %127[^\n]", cs3);
+        printf("    ?3 charset: "); char cs3[128]; if(scanf(" %127[^\n]", cs3)) {};
         if (strlen(cs3) > 0) custom_charsets[2] = cs3;
-        printf("    ?4 charset: "); char cs4[128]; scanf(" %127[^\n]", cs4);
+        printf("    ?4 charset: "); char cs4[128]; if(scanf(" %127[^\n]", cs4)) {};
         if (strlen(cs4) > 0) custom_charsets[3] = cs4;
 
         char h_charsets[10][128];
@@ -1688,10 +1691,10 @@ int main() {
     }
 
     if (attack_mode == 2) {
-        printf("\n[6] Enter Wordlist Path: "); scanf("%255s", wordlist_path);
+        printf("\n[6] Enter Wordlist Path: "); if(scanf("%255s", wordlist_path)) {};
 
         int apply_rules = 0;
-        printf("\n[7] Apply basic mutation rules to wordlist? (1=Yes, 0=No): "); scanf("%d", &apply_rules);
+        printf("\n[7] Apply basic mutation rules to wordlist? (1=Yes, 0=No): "); if(scanf("%d", &apply_rules)) {};
 
         FILE* fp = fopen(wordlist_path, "r");
         if (!fp) {
@@ -1838,7 +1841,7 @@ int main() {
 
     if (attack_mode == 4) {
         // Hybrid Attack (Dictionary + Mask)
-        printf("\n[6] Enter Wordlist Path: "); scanf("%255s", wordlist_path);
+        printf("\n[6] Enter Wordlist Path: "); if(scanf("%255s", wordlist_path)) {};
 
         FILE* fp = fopen(wordlist_path, "r");
         if (!fp) {
@@ -1847,18 +1850,18 @@ int main() {
         }
 
         char mask_pattern[64];
-        printf("\n[7] Enter Mask Pattern (e.g., ?d?d): "); scanf("%63s", mask_pattern);
+        printf("\n[7] Enter Mask Pattern (e.g., ?d?d): "); if(scanf("%63s", mask_pattern)) {};
 
         // Custom charsets for ?1, ?2, ?3, ?4
         const char* custom_charsets[4] = {NULL, NULL, NULL, NULL};
         printf("\n[7a] Enter Custom Charsets (optional, press Enter to skip):\n");
-        printf("    ?1 charset: "); char cs1[128]; scanf(" %127[^\n]", cs1);
+        printf("    ?1 charset: "); char cs1[128]; if(scanf(" %127[^\n]", cs1)) {};
         if (strlen(cs1) > 0) custom_charsets[0] = cs1;
-        printf("    ?2 charset: "); char cs2[128]; scanf(" %127[^\n]", cs2);
+        printf("    ?2 charset: "); char cs2[128]; if(scanf(" %127[^\n]", cs2)) {};
         if (strlen(cs2) > 0) custom_charsets[1] = cs2;
-        printf("    ?3 charset: "); char cs3[128]; scanf(" %127[^\n]", cs3);
+        printf("    ?3 charset: "); char cs3[128]; if(scanf(" %127[^\n]", cs3)) {};
         if (strlen(cs3) > 0) custom_charsets[2] = cs3;
-        printf("    ?4 charset: "); char cs4[128]; scanf(" %127[^\n]", cs4);
+        printf("    ?4 charset: "); char cs4[128]; if(scanf(" %127[^\n]", cs4)) {};
         if (strlen(cs4) > 0) custom_charsets[3] = cs4;
 
         char h_charsets[10][128];
@@ -2027,9 +2030,9 @@ int main() {
         if (nvml_available) shutdownNVML();
         return 0;
     } else {
-        printf("\n[6] Enter Length Range (min max): "); scanf("%d %d", &min_len, &max_len);
-        printf("\n[7] Select Run Mode (1: 12h, 2: Fixed B): "); scanf("%d", &limit_choice);
-        if(limit_choice == 2) { printf("    Enter Billions: "); double b; scanf("%lf", &b); fixed_limit = (uint64_t)(b * 1000000000ULL); }
+        printf("\n[6] Enter Length Range (min max): "); if(scanf("%d %d", &min_len, &max_len)) {};
+        printf("\n[7] Select Run Mode (1: 12h, 2: Fixed B): "); if(scanf("%d", &limit_choice)) {};
+        if(limit_choice == 2) { printf("    Enter Billions: "); double b; if(scanf("%lf", &b)) {}; fixed_limit = (uint64_t)(b * 1000000000ULL); }
 
         const char* h_charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%&*";
         int h_charset_len = strlen(h_charset);
