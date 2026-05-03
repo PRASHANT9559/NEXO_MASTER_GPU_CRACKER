@@ -33,7 +33,7 @@
 } while(0)
 
 // --- Constant Memory ---
-__constant__ uint8_t c_target[32];
+__constant__ __align__(4) uint8_t c_target[32];
 __constant__ char c_charset[70];
 __constant__ char c_salt[64]; // Salt for salted hashes
 __constant__ char c_mask_pattern[64]; // Mask pattern (e.g., "?l?l?d?d")
@@ -79,6 +79,7 @@ __device__ void sha256_transform(uint32_t *state, const uint8_t *chunk) {
 
     // Load first 16 words with warp shuffle optimization (FIXED: Commented out to prevent 32x slowdown)
     // int lane_id = threadIdx.x % 32;
+    #pragma unroll
     for(i=0;i<16;i++) {
         uint32_t word = (chunk[i*4]<<24)|(chunk[i*4+1]<<16)|(chunk[i*4+2]<<8)|chunk[i*4+3];
         // word = __shfl_sync(0xFFFFFFFF, word, 0); // DISABLED: Each thread has a different candidate!
@@ -87,6 +88,7 @@ __device__ void sha256_transform(uint32_t *state, const uint8_t *chunk) {
 
     a=state[0];b=state[1];c=state[2];d=state[3];e=state[4];f=state[5];g=state[6];h=state[7];
 
+    #pragma unroll
     for(i=0;i<64;i++){
         // Compute W[i] on-the-fly if needed
         if(i >= 16) {
@@ -114,7 +116,8 @@ __device__ void sha256_hash(const char *input, int len, uint8_t *output) {
         uint64_t chunk_offset = chunk_idx * 64;
 
         // Fill chunk with input data
-        for (int i = 0; i < 64; i++) {
+        #pragma unroll
+    for (int i = 0; i < 64; i++) {
             uint64_t input_pos = chunk_offset + i;
             if (input_pos < (uint64_t)len) {
                 chunk[i] = (uint8_t)input[input_pos];
@@ -172,6 +175,7 @@ __device__ void md5_hash(const char *input, int len, uint8_t *output) {
     uint32_t s[] = { 7, 12, 17, 22, 5, 9, 14, 20, 4, 11, 16, 23, 6, 10, 15, 21 };
 
     uint32_t tempA = a, tempB = b, tempC = c, tempD = d;
+    #pragma unroll
     for(int i=0; i<64; i++) {
         uint32_t f, g;
         if(i<16) { f = F(tempB, tempC, tempD); g = i; }
@@ -195,8 +199,10 @@ __device__ void sha1_hash(const char *input, int len, uint8_t *output) {
     ((uint8_t*)w)[len ^ 3] = 0x80;
     w[15] = (uint32_t)(len * 8);
 
+    #pragma unroll
     for (int i = 16; i < 80; i++) w[i] = ROTL(w[i-3] ^ w[i-8] ^ w[i-14] ^ w[i-16], 1);
     uint32_t a = h0, b = h1, c = h2, d = h3, e = h4;
+    #pragma unroll
     for (int i = 0; i < 80; i++) {
         uint32_t f, k;
         if (i < 20) { f = (b & c) | ((~b) & d); k = 0x5A827999; }
@@ -222,6 +228,7 @@ __device__ uint32_t md4_H(uint32_t x, uint32_t y, uint32_t z) { return x ^ y ^ z
 
 __device__ void md4_transform(uint32_t *state, const uint8_t *chunk) {
     uint32_t W[16];
+    #pragma unroll
     for(int i=0; i<16; i++) W[i] = chunk[i*4] | (chunk[i*4+1] << 8) | (chunk[i*4+2] << 16) | (chunk[i*4+3] << 24);
 
     uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
@@ -277,7 +284,8 @@ __device__ void md4_hash(const char *input, int len, uint8_t *output) {
         uint8_t chunk[64] = {0};
         uint64_t chunk_offset = chunk_idx * 64;
 
-        for (int i = 0; i < 64; i++) {
+        #pragma unroll
+    for (int i = 0; i < 64; i++) {
             uint64_t input_pos = chunk_offset + i;
             if (input_pos < (uint64_t)utf16_len) {
                 chunk[i] = utf16[input_pos];
@@ -834,16 +842,28 @@ __global__ void crackSHA256(uint64_t offset, int len, int iterations) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t start_n = offset + (idx * iterations);
     char candidate[64];
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
+    uint8_t indices[64];
+
+    uint64_t n = start_n;
+    for (int i = len - 1; i >= 0; i--) {
+        indices[i] = n % c_charset_len;
+        candidate[i] = c_charset[indices[i]];
+        n /= c_charset_len;
+    }
+    candidate[len] = '\0';
 
     for (int i = 0; i < iterations; i++) {
         if (d_found) return;
-        indexToPassword(start_n + i, len, candidate);
+
         sha256_hash(candidate, len, hash);
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
@@ -851,6 +871,16 @@ __global__ void crackSHA256(uint64_t offset, int len, int iterations) {
                 for(int k=0; k<=len; k++) d_result[k] = candidate[k];
             }
             return;
+        }
+
+        for (int j = len - 1; j >= 0; j--) {
+            indices[j]++;
+            if (indices[j] < c_charset_len) {
+                candidate[j] = c_charset[indices[j]];
+                break;
+            }
+            indices[j] = 0;
+            candidate[j] = c_charset[0];
         }
     }
 }
@@ -859,16 +889,28 @@ __global__ void crackMD5(uint64_t offset, int len, int iterations) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t start_n = offset + (idx * iterations);
     char candidate[64];
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
+    uint8_t indices[64];
+
+    uint64_t n = start_n;
+    for (int i = len - 1; i >= 0; i--) {
+        indices[i] = n % c_charset_len;
+        candidate[i] = c_charset[indices[i]];
+        n /= c_charset_len;
+    }
+    candidate[len] = '\0';
 
     for (int i = 0; i < iterations; i++) {
         if (d_found) return;
-        indexToPassword(start_n + i, len, candidate);
+
         md5_hash(candidate, len, hash);
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
@@ -876,6 +918,16 @@ __global__ void crackMD5(uint64_t offset, int len, int iterations) {
                 for(int k=0; k<=len; k++) d_result[k] = candidate[k];
             }
             return;
+        }
+
+        for (int j = len - 1; j >= 0; j--) {
+            indices[j]++;
+            if (indices[j] < c_charset_len) {
+                candidate[j] = c_charset[indices[j]];
+                break;
+            }
+            indices[j] = 0;
+            candidate[j] = c_charset[0];
         }
     }
 }
@@ -884,16 +936,28 @@ __global__ void crackSHA1(uint64_t offset, int len, int iterations) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t start_n = offset + (idx * iterations);
     char candidate[64];
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
+    uint8_t indices[64];
+
+    uint64_t n = start_n;
+    for (int i = len - 1; i >= 0; i--) {
+        indices[i] = n % c_charset_len;
+        candidate[i] = c_charset[indices[i]];
+        n /= c_charset_len;
+    }
+    candidate[len] = '\0';
 
     for (int i = 0; i < iterations; i++) {
         if (d_found) return;
-        indexToPassword(start_n + i, len, candidate);
+
         sha1_hash(candidate, len, hash);
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
@@ -901,6 +965,16 @@ __global__ void crackSHA1(uint64_t offset, int len, int iterations) {
                 for(int k=0; k<=len; k++) d_result[k] = candidate[k];
             }
             return;
+        }
+
+        for (int j = len - 1; j >= 0; j--) {
+            indices[j]++;
+            if (indices[j] < c_charset_len) {
+                candidate[j] = c_charset[indices[j]];
+                break;
+            }
+            indices[j] = 0;
+            candidate[j] = c_charset[0];
         }
     }
 }
@@ -909,16 +983,28 @@ __global__ void crackNTLM(uint64_t offset, int len, int iterations) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t start_n = offset + (idx * iterations);
     char candidate[64];
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
+    uint8_t indices[64];
+
+    uint64_t n = start_n;
+    for (int i = len - 1; i >= 0; i--) {
+        indices[i] = n % c_charset_len;
+        candidate[i] = c_charset[indices[i]];
+        n /= c_charset_len;
+    }
+    candidate[len] = '\0';
 
     for (int i = 0; i < iterations; i++) {
         if (d_found) return;
-        indexToPassword(start_n + i, len, candidate);
+
         ntlm_hash(candidate, len, hash);
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
@@ -926,6 +1012,16 @@ __global__ void crackNTLM(uint64_t offset, int len, int iterations) {
                 for(int k=0; k<=len; k++) d_result[k] = candidate[k];
             }
             return;
+        }
+
+        for (int j = len - 1; j >= 0; j--) {
+            indices[j]++;
+            if (indices[j] < c_charset_len) {
+                candidate[j] = c_charset[indices[j]];
+                break;
+            }
+            indices[j] = 0;
+            candidate[j] = c_charset[0];
         }
     }
 }
@@ -934,18 +1030,30 @@ __global__ void crackMySQL41(uint64_t offset, int len, int iterations) {
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t start_n = offset + (idx * iterations);
     char candidate[64];
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
+    uint8_t indices[64];
+
+    uint64_t n = start_n;
+    for (int i = len - 1; i >= 0; i--) {
+        indices[i] = n % c_charset_len;
+        candidate[i] = c_charset[indices[i]];
+        n /= c_charset_len;
+    }
+    candidate[len] = '\0';
 
     for (int i = 0; i < iterations; i++) {
         if (d_found) return;
-        indexToPassword(start_n + i, len, candidate);
+
         uint8_t tmp[20];
         sha1_hash(candidate, len, tmp);
         sha1_hash((char*)tmp, 20, hash);
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
@@ -953,6 +1061,16 @@ __global__ void crackMySQL41(uint64_t offset, int len, int iterations) {
                 for(int k=0; k<=len; k++) d_result[k] = candidate[k];
             }
             return;
+        }
+
+        for (int j = len - 1; j >= 0; j--) {
+            indices[j]++;
+            if (indices[j] < c_charset_len) {
+                candidate[j] = c_charset[indices[j]];
+                break;
+            }
+            indices[j] = 0;
+            candidate[j] = c_charset[0];
         }
     }
 }
@@ -962,7 +1080,8 @@ __global__ void crackKernel(uint64_t offset, int len, int iterations, int type) 
     uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
     uint64_t start_n = offset + (idx * iterations);
     char candidate[64];
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
 
     for (int i = 0; i < iterations; i++) {
         if (d_found) return;
@@ -976,8 +1095,10 @@ __global__ void crackKernel(uint64_t offset, int len, int iterations, int type) 
         }
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
@@ -1062,7 +1183,8 @@ __global__ void dictionaryKernel(int type, int apply_rules, int rule_count) {
             }
 
             // Hash the transformed word
-            uint8_t hash[32];
+            uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
             switch(type) {
                 case 1: case 2: sha256_hash(temp_candidate, temp_len, hash); break;
                 case 3: md5_hash(temp_candidate, temp_len, hash); break;
@@ -1075,8 +1197,10 @@ __global__ void dictionaryKernel(int type, int apply_rules, int rule_count) {
             }
 
             bool match = true;
-            for (int k = 0; k < c_target_bytes; k++) {
-                if (hash[k] != c_target[k]) { match = false; break; }
+            uint32_t* t32 = (uint32_t*)c_target;
+            int words = c_target_bytes / 4;
+            for (int k = 0; k < words; k++) {
+                if (hash32[k] != t32[k]) { match = false; break; }
             }
 
             if (match) {
@@ -1089,7 +1213,8 @@ __global__ void dictionaryKernel(int type, int apply_rules, int rule_count) {
     }
 
     // Hash original word
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
     switch(type) {
         case 1: case 2: sha256_hash(candidate, len, hash); break;
         case 3: md5_hash(candidate, len, hash); break;
@@ -1102,8 +1227,10 @@ __global__ void dictionaryKernel(int type, int apply_rules, int rule_count) {
     }
 
     bool match = true;
-    for (int k = 0; k < c_target_bytes; k++) {
-        if (hash[k] != c_target[k]) { match = false; break; }
+    uint32_t* t32 = (uint32_t*)c_target;
+    int words = c_target_bytes / 4;
+    for (int k = 0; k < words; k++) {
+        if (hash32[k] != t32[k]) { match = false; break; }
     }
 
     if (match) {
@@ -1127,7 +1254,8 @@ __global__ void maskKernel(uint64_t offset, int type) {
     }
     candidate[c_mask_len] = '\0';
 
-    uint8_t hash[32];
+    uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
     switch(type) {
         case 1: case 2: sha256_hash(candidate, c_mask_len, hash); break;
         case 3: md5_hash(candidate, c_mask_len, hash); break;
@@ -1140,8 +1268,10 @@ __global__ void maskKernel(uint64_t offset, int type) {
     }
 
     bool match = true;
-    for (int k = 0; k < c_target_bytes; k++) {
-        if (hash[k] != c_target[k]) { match = false; break; }
+    uint32_t* t32 = (uint32_t*)c_target;
+    int words = c_target_bytes / 4;
+    for (int k = 0; k < words; k++) {
+        if (hash32[k] != t32[k]) { match = false; break; }
     }
 
     if (match) {
@@ -1168,7 +1298,8 @@ __global__ void maskKernelIter(uint64_t offset, int iterations, int type) {
         }
         candidate[c_mask_len] = '\0';
 
-        uint8_t hash[32];
+        uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
         switch(type) {
             case 1: case 2: sha256_hash(candidate, c_mask_len, hash); break;
             case 3: md5_hash(candidate, c_mask_len, hash); break;
@@ -1181,8 +1312,10 @@ __global__ void maskKernelIter(uint64_t offset, int iterations, int type) {
         }
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
@@ -1234,7 +1367,8 @@ __global__ void hybridKernel(int word_idx, uint64_t mask_offset, int mask_iterat
         }
         candidate[dict_len + c_mask_len] = '\0';
 
-        uint8_t hash[32];
+        uint32_t hash32[8];
+    uint8_t* hash = (uint8_t*)hash32;
         int total_len = dict_len + c_mask_len;
         switch(type) {
             case 1: case 2: sha256_hash(candidate, total_len, hash); break;
@@ -1248,8 +1382,10 @@ __global__ void hybridKernel(int word_idx, uint64_t mask_offset, int mask_iterat
         }
 
         bool match = true;
-        for (int k = 0; k < c_target_bytes; k++) {
-            if (hash[k] != c_target[k]) { match = false; break; }
+        uint32_t* t32 = (uint32_t*)c_target;
+        int words = c_target_bytes / 4;
+        for (int k = 0; k < words; k++) {
+            if (hash32[k] != t32[k]) { match = false; break; }
         }
 
         if (match) {
